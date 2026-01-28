@@ -2,7 +2,7 @@
 //!
 //! **Strategy:** Combine delta encoding, prefix compression, and type enumeration.
 //!
-//! **Result:** ~190.14 KB with Zstd (~91.4% smaller than naive)
+//! **Result:** ~181.89 KB with Zstd (-22) (~91.8% smaller than naive)
 //!
 //! ## How it works:
 //!

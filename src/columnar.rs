@@ -2,7 +2,7 @@
 //!
 //! **Strategy:** Store data in columns instead of rows, with per-column encoding.
 //!
-//! **Result:** ~200 KB with Zstd (~91% smaller than naive)
+//! **Result:** ~187 KB with Zstd (-22) (~91.5% smaller than naive)
 //!
 //! ## How it works:
 //!

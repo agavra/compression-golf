@@ -2,7 +2,7 @@
 //!
 //! **Strategy:** Sort events, then use prefix compression for strings.
 //!
-//! **Result:** ~202 KB with Zstd (~91% smaller than naive)
+//! **Result:** ~187 KB with Zstd (-22) (~91.5% smaller than naive)
 //!
 //! ## How it works:
 //!

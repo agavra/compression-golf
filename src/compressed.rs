@@ -12,7 +12,7 @@ pub struct ZstdCodec<C: EventCodec> {
 impl<C: EventCodec> EventCodec for ZstdCodec<C> {
     fn encode(events: &[(EventKey, EventValue)]) -> Result<Bytes, Box<dyn Error>> {
         let inner = C::encode(events)?;
-        let compressed = zstd::encode_all(inner.as_ref(), 3)?;
+        let compressed = zstd::encode_all(inner.as_ref(), 22)?;
         Ok(Bytes::from(compressed))
     }
 

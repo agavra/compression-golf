@@ -130,6 +130,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let decoded = NaiveCodec::decode(&encoded)?;
     assert_eq!(events, decoded);
 
+    // Naive + Zstd
+    let encoded = ZstdCodec::<NaiveCodec>::encode(&events)?;
+    print_row("Naive + Zstd", encoded.len(), baseline);
+    let decoded = ZstdCodec::<NaiveCodec>::decode(&encoded)?;
+    assert_eq!(events, decoded);
+
     // Prefix + Zstd (example)
     let encoded = ZstdCodec::<PrefixCodec>::encode(&events)?;
     print_row("Prefix + Zstd", encoded.len(), baseline);

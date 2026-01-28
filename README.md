@@ -1,6 +1,6 @@
 # bit-golf
 
-**Can you beat 190.14 KB?**
+**Can you beat 181.89 KB?**
 
 A compression challenge: encode 11,351 GitHub events into the smallest possible binary format.
 
@@ -8,10 +8,10 @@ A compression challenge: encode 11,351 GitHub events into the smallest possible 
 
 | Rank | Who | Size | Approach |
 |------|-----|------|----------|
-| 🥇 | [agavra](https://github.com/agavra) | 190.14 KB | delta + prefix + zstd |
-| 🥈 | *[Columnar example](src/columnar.rs)* | 200.03 KB | columnar + dict + rle + zstd |
-| 🥉 | *[Prefix example](src/prefix.rs)* | 202.05 KB | prefix coding + zstd |
-|    | *Zstd* | 243.51 KB | JSON + zstd |
+| 🥇 | [agavra](https://github.com/agavra) | 181.89 KB | delta + prefix + zstd |
+| 🥈 | *[Prefix example](src/prefix.rs)* | 187.07 KB | prefix coding + zstd |
+| 🥉 | *[Columnar example](src/columnar.rs)* | 187.33 KB | columnar + dict + rle + zstd |
+|    | *Zstd* | 206.94 KB | JSON + zstd |
 |    | *Naive (baseline)* | 2.16 MB | JSON serialization |
 
 *[Submit a PR](https://github.com/agavra/bit-golf/pulls) to claim your spot!*
