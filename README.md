@@ -1,6 +1,6 @@
 # compression-golf
 
-**Can you beat 11,917,798 bytes?**
+**Can you beat 9,407,052 bytes?**
 
 A compression challenge: encode 1,000,000 GitHub events into the smallest possible binary format.
 
@@ -8,9 +8,9 @@ A compression challenge: encode 1,000,000 GitHub events into the smallest possib
 
 | Rank | Who                                | Size (Bytes) |
 |------|------------------------------------|--------------|
-| 1    | *[Zstd(22)](src/zstd.rs)*          | 11,917,798   |
-| 2    | [agavra](src/agavra.rs)            | 13,664,824   |
-| 3    | [Zstd(9)](src/zstd.rs)             | 17,869,403   |
+| 1    | [agavra](src/agavra.rs)            | 9,407,052    |
+| 2    | *[Zstd(22)](src/zstd.rs)*          | 11,917,798   |
+| 3    | *[Zstd(9)](src/zstd.rs)*           | 17,869,403   |
 |      | *[Naive (baseline)](src/naive.rs)* | 210,727,389  |
 
 *[Submit a PR](https://github.com/agavra/compression-golf/pulls) to claim your spot!*

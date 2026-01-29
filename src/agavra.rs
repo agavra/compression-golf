@@ -1,57 +1,46 @@
-//! # Agavra Codec (Current Best)
+//! # Agavra Codec
 //!
-//! **Strategy:** Combine delta encoding, block bit-packing, prefix compression,
-//! and type enumeration.
+//! **Strategy:** Delta encoding, block bit-packing, prefix-compressed dictionaries,
+//! and a combined repo tuple dictionary.
 //!
 //! ## How it works:
 //!
-//! This codec combines the best ideas from multiple approaches:
-//!
 //! ### 1. Type Enumeration
 //! Event types are mapped to single-byte indices (0-13 for 14 types).
-//! The dictionary is stored once at the start.
+//! Stored once at the start, sorted by frequency.
 //!
-//! ### 2. Delta Encoding for Numbers
-//! Instead of storing absolute values, store the difference from previous:
+//! ### 2. String Dictionaries with Prefix Compression
+//! Usernames and repo names are stored in separate sorted dictionaries.
+//! Each entry stores: prefix_len (bits shared with previous) + suffix.
+//! Prefix/suffix lengths are bit-packed for efficiency.
+//!
+//! ### 3. Repo Tuple Dictionary
+//! Instead of storing (user_idx, repo_idx, repo_id) separately per event,
+//! unique tuples are stored once in a dictionary. Events reference tuples
+//! by index, reducing 3 fields to 1.
+//!
+//! ### 4. Delta Encoding
+//! Event IDs, tuple indices, and timestamps are delta-encoded:
 //! ```text
-//! IDs:        2489651045, 2489651051, 2489651053
-//! Deltas:     2489651045, +6,         +2          (much smaller!)
+//! IDs:    2489651045, 2489651051, 2489651053
+//! Deltas: 2489651045, +6,         +2          (much smaller!)
 //! ```
-//! Deltas are zigzag-encoded so negative values are also compact.
+//! Deltas are zigzag-encoded so negative values stay compact.
 //!
-//! ### 3. Block Bit-Packing
-//! Events are processed in blocks of 32. For each block:
-//! - Find the maximum bit-width needed per field
-//! - Pack all values at that bit-width (no wasted continuation bits)
-//! - Each block has 5 packed arrays (one per field)
-//!
-//! This eliminates the ~12.5% overhead from varint continuation bits.
-//!
-//! ### 4. Hybrid Dictionary for Repo Names
-//! Repo names (e.g., "user/repo") are split into two prefix-encoded dictionaries:
-//! - Username dictionary: prefix-encoded list of unique usernames
-//! - Repo name dictionary: prefix-encoded list of unique repo names
-//! URLs are derived from repo names (`https://api.github.com/repos/{name}`).
-//!
-//! ### 5. Timestamp Delta Encoding
-//! All timestamps are within a few hours. Delta-encoded, most are 0-3 seconds
-//! apart → very small values that pack efficiently.
+//! ### 5. Block Bit-Packing
+//! Events are processed in blocks of 64. For each block and field:
+//! - Find the maximum bit-width needed
+//! - Pack all values at that width (no wasted continuation bits)
 //!
 //! ## Data layout:
 //!
 //! ```text
-//! [type_dict][user_dict][repo_dict][event_count]
+//! [type_dict][user_dict][repo_dict][tuple_dict][event_count]
 //! [type_markers: (position, type_idx)...]
-//! [block 0: 5 packed arrays][block 1: 5 packed arrays]...
-//!
-//! Each packed array:
-//! [bit_width: 1 byte][tightly packed values...]
-//!
-//! Each event contributes 5 delta values (zigzag-encoded):
-//!   id_delta, repo_id_delta, user_idx_delta, repo_idx_delta, timestamp_delta
+//! [blocks of 3 packed arrays: id_delta, tuple_idx_delta, ts_delta]
 //! ```
 //!
-//! Output is sorted by id (canonical order).
+//! Output is sorted by (event_type, id) for encoding, returned sorted by id.
 //!
 
 use bytes::Bytes;
@@ -102,7 +91,7 @@ fn zigzag_decode(encoded: u64) -> i64 {
 // Block bit-packing: pack N values using minimum bits per field
 // ============================================================================
 
-const BLOCK_SIZE: usize = 32;
+const BLOCK_SIZE: usize = 64;
 
 fn bits_needed(value: u64) -> u8 {
     if value == 0 {
@@ -222,26 +211,53 @@ impl StringDict {
 
     fn encode(&self, buf: &mut Vec<u8>) {
         encode_varint(self.strings.len() as u64, buf);
+
+        // First pass: collect prefix/suffix lengths
+        let mut prefix_lens: Vec<u64> = Vec::with_capacity(self.strings.len());
+        let mut suffix_lens: Vec<u64> = Vec::with_capacity(self.strings.len());
+        let mut suffixes: Vec<&str> = Vec::with_capacity(self.strings.len());
         let mut prev = String::new();
+
         for s in &self.strings {
             let prefix_len = common_prefix_len(s, &prev);
             let suffix = &s[prefix_len..];
-            encode_varint(prefix_len as u64, buf);
-            encode_varint(suffix.len() as u64, buf);
-            buf.extend_from_slice(suffix.as_bytes());
+            prefix_lens.push(prefix_len as u64);
+            suffix_lens.push(suffix.len() as u64);
+            suffixes.push(suffix);
             prev = s.clone();
+        }
+
+        // Bit-pack the lengths
+        encode_packed_block(&prefix_lens, buf);
+        encode_packed_block(&suffix_lens, buf);
+
+        // Store all suffixes as UTF-8
+        for suffix in suffixes {
+            buf.extend_from_slice(suffix.as_bytes());
         }
     }
 
     fn decode(bytes: &[u8], pos: &mut usize) -> Self {
         let count = decode_varint(bytes, pos) as usize;
+        if count == 0 {
+            return Self {
+                strings: Vec::new(),
+                str_to_idx: HashMap::new(),
+            };
+        }
+
+        // Decode bit-packed lengths
+        let prefix_lens = decode_packed_block(bytes, pos, count);
+        let suffix_lens = decode_packed_block(bytes, pos, count);
+
+        // Reconstruct strings from UTF-8 suffixes
         let mut strings = Vec::with_capacity(count);
         let mut str_to_idx = HashMap::new();
         let mut prev = String::new();
 
         for i in 0..count {
-            let prefix_len = decode_varint(bytes, pos) as usize;
-            let suffix_len = decode_varint(bytes, pos) as usize;
+            let prefix_len = prefix_lens[i] as usize;
+            let suffix_len = suffix_lens[i] as usize;
             let suffix = std::str::from_utf8(&bytes[*pos..*pos + suffix_len]).unwrap();
             *pos += suffix_len;
             let s = format!("{}{}", &prev[..prefix_len], suffix);
@@ -267,6 +283,98 @@ impl StringDict {
 
 fn split_repo_name(full_name: &str) -> (&str, &str) {
     full_name.split_once('/').unwrap_or((full_name, ""))
+}
+
+// ============================================================================
+// Repo tuple dictionary: (user_idx, repo_idx, repo_id) -> tuple_idx
+// ============================================================================
+
+struct RepoTupleDict {
+    // For encoding: (user_idx, repo_idx, repo_id) -> tuple_idx
+    tuple_to_idx: HashMap<(u32, u32, u64), u32>,
+    // For decoding: tuple_idx -> (user_idx, repo_idx, repo_id)
+    tuples: Vec<(u32, u32, u64)>,
+}
+
+impl RepoTupleDict {
+    fn build(
+        events: &[(EventKey, EventValue)],
+        user_dict: &StringDict,
+        repo_dict: &StringDict,
+    ) -> Self {
+        let mut unique: Vec<(u32, u32, u64)> = events
+            .iter()
+            .map(|(_, v)| {
+                let (user, repo) = split_repo_name(&v.repo.name);
+                (
+                    user_dict.get_index(user),
+                    repo_dict.get_index(repo),
+                    v.repo.id,
+                )
+            })
+            .collect();
+        unique.sort();
+        unique.dedup();
+
+        let mut tuple_to_idx = HashMap::new();
+        for (i, tuple) in unique.iter().enumerate() {
+            tuple_to_idx.insert(*tuple, i as u32);
+        }
+
+        Self {
+            tuple_to_idx,
+            tuples: unique,
+        }
+    }
+
+    fn encode(&self, buf: &mut Vec<u8>) {
+        encode_varint(self.tuples.len() as u64, buf);
+
+        // Collect all components for bit-packing
+        let user_idxs: Vec<u64> = self.tuples.iter().map(|(u, _, _)| *u as u64).collect();
+        let repo_idxs: Vec<u64> = self.tuples.iter().map(|(_, r, _)| *r as u64).collect();
+        let repo_ids: Vec<u64> = self.tuples.iter().map(|(_, _, id)| *id).collect();
+
+        encode_packed_block(&user_idxs, buf);
+        encode_packed_block(&repo_idxs, buf);
+        encode_packed_block(&repo_ids, buf);
+    }
+
+    fn decode(bytes: &[u8], pos: &mut usize) -> Self {
+        let count = decode_varint(bytes, pos) as usize;
+        if count == 0 {
+            return Self {
+                tuple_to_idx: HashMap::new(),
+                tuples: Vec::new(),
+            };
+        }
+
+        let user_idxs = decode_packed_block(bytes, pos, count);
+        let repo_idxs = decode_packed_block(bytes, pos, count);
+        let repo_ids = decode_packed_block(bytes, pos, count);
+
+        let mut tuples = Vec::with_capacity(count);
+        let mut tuple_to_idx = HashMap::new();
+
+        for i in 0..count {
+            let tuple = (user_idxs[i] as u32, repo_idxs[i] as u32, repo_ids[i]);
+            tuple_to_idx.insert(tuple, i as u32);
+            tuples.push(tuple);
+        }
+
+        Self {
+            tuple_to_idx,
+            tuples,
+        }
+    }
+
+    fn get_index(&self, user_idx: u32, repo_idx: u32, repo_id: u64) -> u32 {
+        self.tuple_to_idx[&(user_idx, repo_idx, repo_id)]
+    }
+
+    fn get_tuple(&self, index: u32) -> (u32, u32, u64) {
+        self.tuples[index as usize]
+    }
 }
 
 // ============================================================================
@@ -360,6 +468,7 @@ impl EventCodec for AgavraCodec {
             let (_, repo) = split_repo_name(&v.repo.name);
             repo.to_string()
         }));
+        let tuple_dict = RepoTupleDict::build(events, &user_dict, &repo_dict);
 
         // Sort by event_type to group, then by id within each group
         let mut sorted: Vec<_> = events.iter().collect();
@@ -370,16 +479,16 @@ impl EventCodec for AgavraCodec {
         type_enum.encode(&mut buf);
         user_dict.encode(&mut buf);
         repo_dict.encode(&mut buf);
+        tuple_dict.encode(&mut buf);
         encode_varint(sorted.len() as u64, &mut buf);
 
         // Collect all deltas first (for block encoding)
-        let mut all_deltas: Vec<[i64; 5]> = Vec::with_capacity(sorted.len());
+        // Now only 3 fields: id_delta, tuple_idx_delta, ts_delta
+        let mut all_deltas: Vec<[i64; 3]> = Vec::with_capacity(sorted.len());
         let mut type_markers: Vec<(usize, u8)> = Vec::new(); // (position, type_idx)
 
         let mut prev_id: u64 = 0;
-        let mut prev_repo_id: u64 = 0;
-        let mut prev_user_idx: u32 = 0;
-        let mut prev_repo_idx: u32 = 0;
+        let mut prev_tuple_idx: u32 = 0;
         let mut prev_ts: u64 = 0;
         let mut current_type: Option<&str> = None;
 
@@ -394,29 +503,18 @@ impl EventCodec for AgavraCodec {
             let delta_id = id as i64 - prev_id as i64;
             prev_id = id;
 
-            let delta_repo_id = value.repo.id as i64 - prev_repo_id as i64;
-            prev_repo_id = value.repo.id;
-
             let (user, repo) = split_repo_name(&value.repo.name);
             let user_idx = user_dict.get_index(user);
-            let delta_user_idx = user_idx as i64 - prev_user_idx as i64;
-            prev_user_idx = user_idx;
-
             let repo_idx = repo_dict.get_index(repo);
-            let delta_repo_idx = repo_idx as i64 - prev_repo_idx as i64;
-            prev_repo_idx = repo_idx;
+            let tuple_idx = tuple_dict.get_index(user_idx, repo_idx, value.repo.id);
+            let delta_tuple_idx = tuple_idx as i64 - prev_tuple_idx as i64;
+            prev_tuple_idx = tuple_idx;
 
             let ts = parse_timestamp(&value.created_at);
             let delta_ts = ts as i64 - prev_ts as i64;
             prev_ts = ts;
 
-            all_deltas.push([
-                delta_id,
-                delta_repo_id,
-                delta_user_idx,
-                delta_repo_idx,
-                delta_ts,
-            ]);
+            all_deltas.push([delta_id, delta_tuple_idx, delta_ts]);
         }
 
         // Encode type markers
@@ -429,7 +527,7 @@ impl EventCodec for AgavraCodec {
         // Encode in blocks
         for chunk in all_deltas.chunks(BLOCK_SIZE) {
             // Transpose: convert from array of structs to struct of arrays
-            let mut field_values: [Vec<u64>; 5] = Default::default();
+            let mut field_values: [Vec<u64>; 3] = Default::default();
             for deltas in chunk {
                 for (i, &delta) in deltas.iter().enumerate() {
                     field_values[i].push(zigzag_encode(delta));
@@ -451,6 +549,7 @@ impl EventCodec for AgavraCodec {
         let type_enum = TypeEnum::decode(bytes, &mut pos);
         let user_dict = StringDict::decode(bytes, &mut pos);
         let repo_dict = StringDict::decode(bytes, &mut pos);
+        let tuple_dict = RepoTupleDict::decode(bytes, &mut pos);
         let count = decode_varint(bytes, &mut pos) as usize;
 
         // Decode type markers
@@ -463,15 +562,15 @@ impl EventCodec for AgavraCodec {
             type_markers.push((event_pos, type_idx));
         }
 
-        // Decode all blocks
-        let mut all_deltas: Vec<[i64; 5]> = Vec::with_capacity(count);
+        // Decode all blocks (now 3 fields: id_delta, tuple_idx_delta, ts_delta)
+        let mut all_deltas: Vec<[i64; 3]> = Vec::with_capacity(count);
         let mut remaining = count;
 
         while remaining > 0 {
             let block_size = remaining.min(BLOCK_SIZE);
 
             // Decode each field's packed block
-            let mut field_values: [Vec<u64>; 5] = Default::default();
+            let mut field_values: [Vec<u64>; 3] = Default::default();
             for field in &mut field_values {
                 *field = decode_packed_block(bytes, &mut pos, block_size);
             }
@@ -482,8 +581,6 @@ impl EventCodec for AgavraCodec {
                     zigzag_decode(field_values[0][i]),
                     zigzag_decode(field_values[1][i]),
                     zigzag_decode(field_values[2][i]),
-                    zigzag_decode(field_values[3][i]),
-                    zigzag_decode(field_values[4][i]),
                 ]);
             }
 
@@ -493,9 +590,7 @@ impl EventCodec for AgavraCodec {
         // Reconstruct events from deltas
         let mut events = Vec::with_capacity(count);
         let mut prev_id: u64 = 0;
-        let mut prev_repo_id: u64 = 0;
-        let mut prev_user_idx: u32 = 0;
-        let mut prev_repo_idx: u32 = 0;
+        let mut prev_tuple_idx: u32 = 0;
         let mut prev_ts: u64 = 0;
         let mut type_marker_idx = 0;
         let mut current_type = String::new();
@@ -513,21 +608,16 @@ impl EventCodec for AgavraCodec {
             let id = (prev_id as i64 + deltas[0]) as u64;
             prev_id = id;
 
-            let repo_id = (prev_repo_id as i64 + deltas[1]) as u64;
-            prev_repo_id = repo_id;
+            let tuple_idx = (prev_tuple_idx as i64 + deltas[1]) as u32;
+            prev_tuple_idx = tuple_idx;
 
-            let user_idx = (prev_user_idx as i64 + deltas[2]) as u32;
-            prev_user_idx = user_idx;
-
-            let repo_idx = (prev_repo_idx as i64 + deltas[3]) as u32;
-            prev_repo_idx = repo_idx;
-
+            let (user_idx, repo_idx, repo_id) = tuple_dict.get_tuple(tuple_idx);
             let user = user_dict.get_string(user_idx);
             let repo = repo_dict.get_string(repo_idx);
             let repo_name = format!("{}/{}", user, repo);
             let repo_url = format!("https://api.github.com/repos/{}", repo_name);
 
-            let ts = (prev_ts as i64 + deltas[4]) as u64;
+            let ts = (prev_ts as i64 + deltas[2]) as u64;
             prev_ts = ts;
             let created_at = format_timestamp(ts);
 
