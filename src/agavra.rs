@@ -1,7 +1,7 @@
 //! # Agavra Codec
 //!
 //! **Strategy:** Delta encoding, block bit-packing, prefix-compressed dictionaries,
-//! and a combined repo tuple dictionary.
+//! and a combined repo tuple dictionary (lossless).
 //!
 //! ## How it works:
 //!
