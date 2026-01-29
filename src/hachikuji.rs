@@ -349,10 +349,13 @@ impl EventCodec for HachikujiCodec {
             }
         }
 
-        Ok(Bytes::from(buf))
+        let compressed = zstd::encode_all(buf.as_slice(), 22)?;
+        Ok(Bytes::from(compressed))
     }
 
     fn decode(&self, bytes: &[u8]) -> Result<Vec<(EventKey, EventValue)>, Box<dyn Error>> {
+        let decompressed = zstd::decode_all(bytes)?;
+        let bytes = &decompressed;
         let mut pos = 0;
 
         // Read dictionaries
