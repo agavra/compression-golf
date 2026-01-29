@@ -1,4 +1,4 @@
-# bit-golf
+# compression-golf
 
 **Can you beat 12.01 MB?**
 
@@ -13,7 +13,7 @@ A compression challenge: encode 11,351 GitHub events into the smallest possible 
 | 3    | [Zstd(9)](src/zstd.rs)             | 17.04 MB  |
 |      | *[Naive (baseline)](src/naive.rs)* | 200.97 MB |
 
-*[Submit a PR](https://github.com/agavra/bit-golf/pulls) to claim your spot!*
+*[Submit a PR](https://github.com/agavra/compression-golf/pulls) to claim your spot!*
 
 ## The Challenge
 
@@ -21,16 +21,13 @@ Your codec must:
 
 1. Implement the `EventCodec` trait
 2. Perfectly reconstruct the original data (lossless)
-3. Beat the Naive compression (2.16MB)
-
-I supsect the **theoretical minimum is ~150 KB**, which means there's still 
-~20% left on the table!
+3. Beat the Naive codec (200.97MB)
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/agavra/bit-golf
-cd bit-golf
+git clone https://github.com/agavra/compression-golf
+cd compression-golf
 gunzip -k data.json.gz  # decompress the dataset
 cargo run --release
 ```
