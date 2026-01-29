@@ -7,12 +7,14 @@ mod agavra;
 mod codec;
 mod hachikuji;
 mod naive;
+mod xiangpenghao;
 mod zstd;
 
 use agavra::AgavraCodec;
 use codec::EventCodec;
 use hachikuji::HachikujiCodec;
 use naive::NaiveCodec;
+use xiangpenghao::XiangpengHaoCodec;
 use zstd::ZstdCodec;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -179,6 +181,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // (Box::new(ZstdCodec::new(22)), &events), // commented out b/c it takes long to run
         (Box::new(AgavraCodec::new()), &sorted_events),
         (Box::new(HachikujiCodec::new()), &sorted_events),
+        (Box::new(XiangpengHaoCodec::new()), &sorted_events),
     ];
 
     for (codec, expected) in codecs {
