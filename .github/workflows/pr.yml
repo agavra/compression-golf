@@ -7,6 +7,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  pull-requests: write
+
 jobs:
   test:
     name: Test Submissions
@@ -55,17 +58,31 @@ jobs:
         run: cargo build --release
 
       - name: Run codec tests
+        id: test
         run: |
           CODECS="${{ steps.changed.outputs.codecs }}"
           if [ -z "$CODECS" ]; then
             echo "No codec changes detected, running all codecs"
-            cargo run --release
+            cargo run --release 2>&1 | tee results.txt
           else
             for codec in $CODECS; do
               echo "Testing codec: $codec"
-              cargo run --release -- --codec "$codec"
+              cargo run --release -- --codec "$codec" 2>&1 | tee -a results.txt
             done
           fi
+
+      - name: Comment PR with results
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const results = fs.readFileSync('results.txt', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## Codec Test Results\n\n\`\`\`\n${results}\n\`\`\``
+            });
 
       - name: Check formatting
         run: cargo fmt --check
