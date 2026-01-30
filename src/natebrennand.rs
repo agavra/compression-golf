@@ -146,6 +146,92 @@ fn compress_with_params(data: &[u8], level: i32, window_log: Option<u32>, pledge
     encoder.finish().unwrap()
 }
 
+/// Pack u32 values into 24-bit (3 byte) little-endian format
+fn pack_u24(values: &[u32]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(values.len() * 3);
+    for &val in values {
+        // Store low 24 bits as 3 bytes little-endian
+        result.push(val as u8);
+        result.push((val >> 8) as u8);
+        result.push((val >> 16) as u8);
+    }
+    result
+}
+
+/// Unpack 24-bit (3 byte) little-endian values back to u32
+fn unpack_u24(bytes: &[u8], count: usize) -> Vec<u32> {
+    let mut result = Vec::with_capacity(count);
+    for chunk in bytes.chunks_exact(3).take(count) {
+        let val = chunk[0] as u32
+            | ((chunk[1] as u32) << 8)
+            | ((chunk[2] as u32) << 16);
+        result.push(val);
+    }
+    result
+}
+
+/// Pack u32 values into bit-packed bytes (variable bits per value) - for experiments
+fn pack_bits(values: &[u32], bits_per_value: u32) -> Vec<u8> {
+    let total_bits = values.len() as u64 * bits_per_value as u64;
+    let num_bytes = ((total_bits + 7) / 8) as usize;
+    let mut result = vec![0u8; num_bytes];
+
+    let mut bit_pos: u64 = 0;
+    for &val in values {
+        // Write bits_per_value bits starting at bit_pos
+        let mut remaining = bits_per_value;
+        let mut v = val;
+        let mut pos = bit_pos;
+
+        while remaining > 0 {
+            let byte_idx = (pos / 8) as usize;
+            let bit_offset = (pos % 8) as u32;
+            let bits_in_byte = std::cmp::min(remaining, 8 - bit_offset);
+            let mask = ((1u32 << bits_in_byte) - 1) as u8;
+            result[byte_idx] |= ((v as u8) & mask) << bit_offset;
+            v >>= bits_in_byte;
+            remaining -= bits_in_byte;
+            pos += bits_in_byte as u64;
+        }
+        bit_pos += bits_per_value as u64;
+    }
+    result
+}
+
+/// Experiment with bit-packing repo indices
+fn experiment_repo_bit_packing(repo_indices: &[u32]) {
+    eprintln!("\n=== Repo Index Bit-Packing Experiment ===");
+
+    let max_val = *repo_indices.iter().max().unwrap_or(&0);
+    let bits_needed = if max_val > 0 { 32 - max_val.leading_zeros() } else { 1 };
+    eprintln!("Max value: {}, bits needed: {}", max_val, bits_needed);
+
+    // Current: u32 (32 bits)
+    let u32_bytes: Vec<u8> = repo_indices.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let u32_compressed = zstd::encode_all(u32_bytes.as_slice(), ZSTD_LEVEL).unwrap();
+    eprintln!("Current (u32):     {} raw -> {} compressed", u32_bytes.len(), u32_compressed.len());
+
+    // Try different bit widths
+    for bits in [18, 19, 20, 24] {
+        if bits >= bits_needed {
+            let packed = pack_bits(repo_indices, bits);
+            let compressed = zstd::encode_all(packed.as_slice(), ZSTD_LEVEL).unwrap();
+            eprintln!("{}-bit packed:     {} raw -> {} compressed ({:+} vs u32)",
+                bits, packed.len(), compressed.len(),
+                compressed.len() as i64 - u32_compressed.len() as i64);
+        }
+    }
+
+    // Also try u16 if values fit (they don't, but for comparison)
+    if max_val <= u16::MAX as u32 {
+        let u16_bytes: Vec<u8> = repo_indices.iter().flat_map(|v| (*v as u16).to_le_bytes()).collect();
+        let u16_compressed = zstd::encode_all(u16_bytes.as_slice(), ZSTD_LEVEL).unwrap();
+        eprintln!("u16:               {} raw -> {} compressed ({:+} vs u32)",
+            u16_bytes.len(), u16_compressed.len(),
+            u16_compressed.len() as i64 - u32_compressed.len() as i64);
+    }
+}
+
 /// Experiment with different zstd compression approaches
 fn experiment_compression_strategies(
     mapping_tsv: &[u8],
@@ -1268,10 +1354,11 @@ impl EventCodec for NatebrennandCodec {
         let (first_event_id, first_timestamp, num_events, mapping_size, num_event_types) = base_info;
 
         // Convert columns to bytes
-        let repo_bytes: Vec<u8> = columns.repo_pair_indices.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let repo_bytes: Vec<u8> = pack_u24(&columns.repo_pair_indices);  // 24-bit packing
         let ts_bytes: Vec<u8> = columns.created_at_deltas.iter().flat_map(|v| v.to_le_bytes()).collect();
 
         if debug_enabled() {
+            experiment_repo_bit_packing(&columns.repo_pair_indices);
             experiment_compression_strategies(
                 &mapping_tsv,
                 &columns.event_type_dict,
@@ -1383,14 +1470,11 @@ impl EventCodec for NatebrennandCodec {
         offset += header.id_deltas_compressed as usize;
         let event_id_deltas = zstd::decode_all(id_deltas_compressed)?;
 
-        // 5. Repo pair indices (u32 le)
+        // 5. Repo pair indices (24-bit packed)
         let repo_compressed = &bytes[offset..offset + header.repo_compressed as usize];
         offset += header.repo_compressed as usize;
         let repo_bytes = zstd::decode_all(repo_compressed)?;
-        let repo_pair_indices: Vec<u32> = repo_bytes
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
-            .collect();
+        let repo_pair_indices = unpack_u24(&repo_bytes, num_events);
 
         // 6. Created at deltas (i16 le)
         let ts_compressed = &bytes[offset..offset + header.ts_compressed as usize];
