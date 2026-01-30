@@ -149,6 +149,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut path = "data.json".to_string();
     let mut codec_filter: Option<String> = None;
+    let mut docker_enabled = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -158,6 +159,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                     codec_filter = Some(args[i + 1].to_lowercase());
                     i += 1;
                 }
+            }
+            "--docker" => {
+                docker_enabled = true;
             }
             arg if !arg.starts_with('-') => {
                 path = arg.to_string();
