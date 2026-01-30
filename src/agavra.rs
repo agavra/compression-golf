@@ -47,6 +47,7 @@ use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
 use std::collections::HashMap;
 use std::error::Error;
+use std::io::{Read as IoRead, Write as IoWrite};
 
 use crate::codec::EventCodec;
 use crate::{EventKey, EventValue, Repo};
@@ -540,10 +541,21 @@ impl EventCodec for AgavraCodec {
             }
         }
 
-        Ok(Bytes::from(buf))
+        // Compress with zstd level 22
+        let mut encoder = zstd::Encoder::new(Vec::new(), 22)?;
+        encoder.write_all(&buf)?;
+        let compressed = encoder.finish()?;
+
+        Ok(Bytes::from(compressed))
     }
 
     fn decode(&self, bytes: &[u8]) -> Result<Vec<(EventKey, EventValue)>, Box<dyn Error>> {
+        // Decompress with zstd
+        let mut decoder = zstd::Decoder::new(bytes)?;
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed)?;
+        let bytes = &decompressed;
+
         let mut pos = 0;
 
         let type_enum = TypeEnum::decode(bytes, &mut pos);

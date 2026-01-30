@@ -16,9 +16,9 @@ This leaderboard uses the `data.json.gz` dataset included in the repo. Use this 
 |------|------------------------------------|--------------|
 | 1    | [hachikuji](src/hachikuji.rs)      | 6,524,516    |
 | 2    | [XiangpengHao](src/xiangpenghao.rs)| 6,847,283    |
-| 3    | [fabinout](src/fabinout.rs)        | 7,283,778    |
-| 4    | [samsond](src/samsond.rs)          | 7,564,554    |
-| 5    | [agavra](src/agavra.rs)            | 9,407,052    |
+| 3    | [agavra](src/agavra.rs)            | 7,273,680    |
+| 4    | [fabinout](src/fabinout.rs)        | 7,283,778    |
+| 5    | [samsond](src/samsond.rs)          | 7,564,554    |
 | 6    | *[Zstd(22)](src/zstd.rs)*          | 11,917,798   |
 | 7    | *[Zstd(9)](src/zstd.rs)*           | 17,869,403   |
 |      | *[Naive (baseline)](src/naive.rs)* | 210,727,389  |
