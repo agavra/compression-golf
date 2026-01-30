@@ -15,7 +15,7 @@
 //! Repo dictionary is sorted by first appearance in the stream, not lexicographically.
 //! Measured: 50% of events introduce new repos; 29% of repo deltas satisfy |delta| ≤ 10
 //! (ZigZag ≤ 20 => 1-byte varint).
-//! 
+//!
 //! Real example from data.json (first 4 events):
 //! ```
 //! Event 1: mshdabiola/NotePad              -> repo_idx=0 (delta=0)  -> 0x00
@@ -26,11 +26,11 @@
 //! All repo_idx deltas encode to 1 byte (ZigZag-signed varint: +1 -> 2 -> 0x02).
 //! Early in stream, new repos dominate so deltas are often +1. Later, repo reuse
 //! introduces negative/larger deltas, but first-occurrence ordering keeps them smaller.
-//! 
+//!
 //! Compare to lexicographic ordering where "aws-actions" would be idx=0, "heytrgithub"
 //! idx=1, "mshdabiola" idx=2, "xbmc" idx=3, causing event 1 to reference idx=2
 //! (delta=+2 from start, encoded as 0x04).
-//! 
+//!
 //! Trade: Prefix compression still works (compress against previous dict entry) but
 //! loses alphabetical adjacency. One-time dictionary cost vs per-event delta benefit.
 //! Result: Measured 104 KB improvement over lexicographic (7.67 MB to 7.56 MB).
@@ -62,7 +62,6 @@
 //!    - timestamp delta (signed varint) - measured: |delta| ≤ 63s, so ZigZag < 128 => 100% 1-byte varints
 //!    - event_id delta (signed varint) - measured: 99% are 1-byte (monotonic IDs)
 //! 4. **Final compression** - zstd(22) on the optimized binary stream
-
 
 use bytes::Bytes;
 use chrono::{DateTime, TimeZone};
@@ -143,8 +142,8 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
 // ============================================================================
 
 struct RepoDict {
-    entries: Vec<(String, u64)>,                    // idx -> (repo_name, repo_id)
-    entry_to_idx: HashMap<(String, u64), u32>,      // (repo_name, repo_id) -> idx
+    entries: Vec<(String, u64)>,               // idx -> (repo_name, repo_id)
+    entry_to_idx: HashMap<(String, u64), u32>, // (repo_name, repo_id) -> idx
 }
 
 impl RepoDict {
@@ -152,7 +151,7 @@ impl RepoDict {
         // CRITICAL: Same repo name can have different IDs in the data
         // (e.g., "01Yomi/01yomi.github.io" has both ID 910666850 and 910668463)
         // Must use (name, id) tuple as key for lossless compression.
-        
+
         // Sort by first occurrence to minimize repo_idx deltas.
         // Key insight: when repos appear in discovery order, consecutive events
         // reference nearby indices = small deltas = better varint compression.
@@ -163,10 +162,10 @@ impl RepoDict {
             let key = (v.repo.name.clone(), v.repo.id);
             first_occurrence.entry(key).or_insert(i);
         }
-        
+
         let mut unique: Vec<(String, u64)> = first_occurrence.keys().cloned().collect();
         unique.sort_by_key(|k| first_occurrence[k]);
-        
+
         let mut entry_to_idx = HashMap::new();
         for (i, entry) in unique.iter().enumerate() {
             entry_to_idx.insert(entry.clone(), i as u32);
@@ -189,7 +188,7 @@ impl RepoDict {
             encode_varint(suffix.len() as u64, buf);
             buf.extend_from_slice(suffix.as_bytes());
             prev_name = name.clone();
-            
+
             encode_varint(*id, buf);
         }
     }
@@ -209,7 +208,7 @@ impl RepoDict {
 
             let name = format!("{}{}", &prev_name[..prefix_len], suffix);
             let id = decode_varint(bytes, pos);
-            
+
             entry_to_idx.insert((name.clone(), id), i as u32);
             prev_name = name.clone();
             entries.push((name, id));
@@ -319,7 +318,7 @@ impl EventCodec for SamsondCodec {
         let mut buf = Vec::new();
         self.write_header(&type_enum, &repo_dict, events.len(), &mut buf);
         self.write_events(events, &type_enum, &repo_dict, &mut buf);
-        
+
         let compressed = zstd::encode_all(buf.as_slice(), ZSTD_LEVEL)?;
         Ok(Bytes::from(compressed))
     }

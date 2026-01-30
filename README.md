@@ -15,10 +15,11 @@ This leaderboard uses the `data.json.gz` dataset included in the repo. Use this 
 | Rank | Who                                | Size (Bytes) |
 |------|------------------------------------|--------------|
 | 1    | [XiangpengHao](src/xiangpenghao.rs)| 6,847,283    |
-| 2    | [hachikuji](src/hachikuji.rs)      | 8,552,007    |
-| 3    | [agavra](src/agavra.rs)            | 9,407,052    |
-| 4    | *[Zstd(22)](src/zstd.rs)*          | 11,917,798   |
-| 5    | *[Zstd(9)](src/zstd.rs)*           | 17,869,403   |
+| 2    | [samsond](src/samsond.rs)          | 7,564,554    |
+| 3    | [hachikuji](src/hachikuji.rs)      | 8,552,007    |
+| 4    | [agavra](src/agavra.rs)            | 9,407,052    |
+| 5    | *[Zstd(22)](src/zstd.rs)*          | 11,917,798   |
+| 6    | *[Zstd(9)](src/zstd.rs)*           | 17,869,403   |
 |      | *[Naive (baseline)](src/naive.rs)* | 210,727,389  |
 
 ### Evaluation Dataset Leaderboard
