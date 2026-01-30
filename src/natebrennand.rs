@@ -174,6 +174,48 @@ fn unpack_u24(bytes: &[u8], count: usize) -> Vec<u32> {
     result
 }
 
+/// Encode i16 values as zigzag + varint
+fn encode_varint_i16(values: &[i16]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(values.len() * 2);
+    for &v in values {
+        // ZigZag encode: (v << 1) ^ (v >> 15)
+        let zigzag = ((v as i32) << 1) ^ ((v as i32) >> 31);
+        let mut val = zigzag as u32;
+        loop {
+            if val < 128 {
+                result.push(val as u8);
+                break;
+            }
+            result.push((val as u8 & 0x7f) | 0x80);
+            val >>= 7;
+        }
+    }
+    result
+}
+
+/// Decode zigzag + varint back to i16 values
+fn decode_varint_i16(bytes: &[u8], count: usize) -> Vec<i16> {
+    let mut result = Vec::with_capacity(count);
+    let mut pos = 0;
+    for _ in 0..count {
+        let mut val: u32 = 0;
+        let mut shift = 0;
+        loop {
+            let b = bytes[pos];
+            pos += 1;
+            val |= ((b & 0x7f) as u32) << shift;
+            if b < 128 {
+                break;
+            }
+            shift += 7;
+        }
+        // ZigZag decode: (val >> 1) ^ -(val & 1)
+        let decoded = ((val >> 1) as i32) ^ -((val & 1) as i32);
+        result.push(decoded as i16);
+    }
+    result
+}
+
 /// Pack u32 values into bit-packed bytes (variable bits per value) - for experiments
 fn pack_bits(values: &[u32], bits_per_value: u32) -> Vec<u8> {
     let total_bits = values.len() as u64 * bits_per_value as u64;
@@ -200,6 +242,71 @@ fn pack_bits(values: &[u32], bits_per_value: u32) -> Vec<u8> {
         bit_pos += bits_per_value as u64;
     }
     result
+}
+
+/// Experiment with variable-width timestamp deltas
+fn experiment_timestamp_encoding(deltas: &[i16]) {
+    eprintln!("\n=== Timestamp Delta Encoding Experiment ===");
+
+    let fits_i8 = deltas.iter().filter(|&&d| d >= i8::MIN as i16 && d <= i8::MAX as i16).count();
+    eprintln!("Deltas fitting in i8: {} ({:.2}%)", fits_i8, fits_i8 as f64 / deltas.len() as f64 * 100.0);
+
+    // Current: i16 (2 bytes each)
+    let i16_bytes: Vec<u8> = deltas.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let i16_compressed = zstd::encode_all(i16_bytes.as_slice(), ZSTD_LEVEL).unwrap();
+    eprintln!("Current (i16):       {} raw -> {} compressed", i16_bytes.len(), i16_compressed.len());
+
+    // Option 1: Pack i8 values with exception list for larger values
+    // Format: [i8 values where value fits, else i8::MIN as sentinel] + [exception list]
+    let mut packed_i8: Vec<u8> = Vec::with_capacity(deltas.len());
+    let mut exceptions: Vec<(u32, i16)> = Vec::new(); // (index, value)
+    for (i, &d) in deltas.iter().enumerate() {
+        if d >= i8::MIN as i16 && d <= i8::MAX as i16 {
+            packed_i8.push(d as i8 as u8);
+        } else {
+            packed_i8.push(i8::MIN as u8); // sentinel
+            exceptions.push((i as u32, d));
+        }
+    }
+    let exception_bytes: Vec<u8> = exceptions.iter()
+        .flat_map(|(idx, val)| {
+            let mut v = Vec::with_capacity(6);
+            v.extend_from_slice(&idx.to_le_bytes()[..3]); // 24-bit index
+            v.extend_from_slice(&val.to_le_bytes()); // i16 value
+            v
+        })
+        .collect();
+
+    let packed_compressed = zstd::encode_all(packed_i8.as_slice(), ZSTD_LEVEL).unwrap();
+    let exceptions_compressed = zstd::encode_all(exception_bytes.as_slice(), ZSTD_LEVEL).unwrap();
+    let option1_total = packed_compressed.len() + exceptions_compressed.len();
+
+    eprintln!("Option 1 (i8 + exceptions):");
+    eprintln!("  i8 values:         {} -> {} compressed", packed_i8.len(), packed_compressed.len());
+    eprintln!("  Exceptions ({}):  {} -> {} compressed",
+        exceptions.len(), exception_bytes.len(), exceptions_compressed.len());
+    eprintln!("  Total:             {} ({:+} vs i16)",
+        option1_total, option1_total as i64 - i16_compressed.len() as i64);
+
+    // Option 2: Varint encoding
+    let mut varint_bytes: Vec<u8> = Vec::new();
+    for &d in deltas {
+        // ZigZag encode then varint
+        let zigzag = ((d as i32) << 1) ^ ((d as i32) >> 31);
+        let mut val = zigzag as u32;
+        loop {
+            if val < 128 {
+                varint_bytes.push(val as u8);
+                break;
+            }
+            varint_bytes.push((val as u8 & 0x7f) | 0x80);
+            val >>= 7;
+        }
+    }
+    let varint_compressed = zstd::encode_all(varint_bytes.as_slice(), ZSTD_LEVEL).unwrap();
+    eprintln!("Option 2 (varint):   {} raw -> {} compressed ({:+} vs i16)",
+        varint_bytes.len(), varint_compressed.len(),
+        varint_compressed.len() as i64 - i16_compressed.len() as i64);
 }
 
 /// Experiment with bit-packing repo indices
@@ -1359,9 +1466,10 @@ impl EventCodec for NatebrennandCodec {
 
         // Convert columns to bytes
         let repo_bytes: Vec<u8> = pack_u24(&columns.repo_pair_indices);  // 24-bit packing
-        let ts_bytes: Vec<u8> = columns.created_at_deltas.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let ts_bytes: Vec<u8> = encode_varint_i16(&columns.created_at_deltas);  // varint encoding
 
         if debug_enabled() {
+            experiment_timestamp_encoding(&columns.created_at_deltas);
             experiment_repo_bit_packing(&columns.repo_pair_indices);
             experiment_compression_strategies(
                 &mapping_tsv,
@@ -1480,13 +1588,10 @@ impl EventCodec for NatebrennandCodec {
         let repo_bytes = zstd::decode_all(repo_compressed)?;
         let repo_pair_indices = unpack_u24(&repo_bytes, num_events);
 
-        // 6. Created at deltas (i16 le)
+        // 6. Created at deltas (varint encoded)
         let ts_compressed = &bytes[offset..offset + header.ts_compressed as usize];
         let ts_bytes = zstd::decode_all(ts_compressed)?;
-        let created_at_deltas: Vec<i16> = ts_bytes
-            .chunks_exact(2)
-            .map(|chunk| i16::from_le_bytes(chunk.try_into().unwrap()))
-            .collect();
+        let created_at_deltas = decode_varint_i16(&ts_bytes, num_events);
 
         // Decode events
         let mut events = decode_columns(
