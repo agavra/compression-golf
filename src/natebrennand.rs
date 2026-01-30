@@ -66,10 +66,16 @@
 //!   - Delta encoding for repo_pair_idx: Repos are essentially random when sorted
 //!     by event_id (99.6% runs of length 1). Deltas span full range (-262K to +262K),
 //!     only 26% fit in i16. Would use 3.47MB vs zstd's 2.32MB.
-//!   - FST (finite state transducer) for repo mapping: FST compresses repo names
-//!     well (5.78MB raw vs 9.37MB TSV), and FST+zstd (3.61MB) beats TSV+zstd (3.78MB).
-//!     But FST only stores name->idx, not repo_ids. Adding repo_ids separately
-//!     (1.01MB compressed) makes total 4.62MB, worse than TSV's 3.78MB.
+//!   - FST (finite state transducer) for repo mapping: Tried two approaches:
+//!     (a) FST name->idx + separate repo_ids: 4.62 B/row vs TSV's 3.78 B/row
+//!     (b) FST name->(repo_id|variant) with variant in high bits for renamed repos:
+//!         - Only 419 repos (0.2%) have multiple names, max 4 names per ID
+//!         - repo_ids need 30 bits, leaving 2 bits for variant in u32
+//!         - But FST+zstd (4.71 B/row) > TSV+zstd (3.78 B/row)
+//!         - And per-event combined values (2.60 B/row) > sequential indices (2.32 B/row)
+//!         - Total: 7.31 B/row vs current 6.10 B/row - 16.6% worse
+//!     Conclusion: zstd's prefix compression on alphabetical TSV beats FST, and
+//!     sequential indices compress better than scattered repo_ids.
 //!
 //! Current results (1M events):
 //!   - event_type:       0.22 B/row (4-bit packed)
@@ -341,7 +347,7 @@ fn print_repo_pair_idx_analysis(indices: &[u32]) {
 }
 
 /// Analyze FST vs TSV for repo mapping
-fn analyze_fst_vs_tsv(mapping_tsv: &[u8], num_rows: usize) {
+fn analyze_fst_vs_tsv(mapping_tsv: &[u8], num_rows: usize, per_event_pair_idx: &[u32]) {
     // Parse TSV to get repo names and ids
     let tsv = std::str::from_utf8(mapping_tsv).unwrap();
     let mut entries: Vec<(String, u32)> = Vec::new();
@@ -405,6 +411,199 @@ fn analyze_fst_vs_tsv(mapping_tsv: &[u8], num_rows: usize) {
         eprintln!("  TSV WINS by {} bytes ({:.1}%)",
             fst_total - tsv_compressed,
             (1.0 - tsv_compressed as f64 / fst_total as f64) * 100.0);
+    }
+
+    // Analyze repo_id -> names relationship (for rename detection)
+    // Re-parse to get original (id, name) pairs before dedup
+    let mut id_to_names: HashMap<u32, Vec<String>> = HashMap::new();
+    for line in tsv.lines() {
+        if line.is_empty() { continue; }
+        let mut parts = line.split('\t');
+        let id: u32 = parts.next().unwrap().parse().unwrap();
+        let name = parts.next().unwrap().to_string();
+        id_to_names.entry(id).or_default().push(name);
+    }
+
+    let ids_with_one_name = id_to_names.values().filter(|v| v.len() == 1).count();
+    let ids_with_multi_names = id_to_names.values().filter(|v| v.len() > 1).count();
+    let max_names_per_id = id_to_names.values().map(|v| v.len()).max().unwrap_or(0);
+
+    eprintln!("\n=== Repo Rename Analysis ===");
+    eprintln!("  Unique repo_ids:    {:>10}", id_to_names.len());
+    eprintln!("  IDs with 1 name:    {:>10} ({:.1}%)",
+        ids_with_one_name, ids_with_one_name as f64 / id_to_names.len() as f64 * 100.0);
+    eprintln!("  IDs with 2+ names:  {:>10} ({:.1}%) [renamed repos]",
+        ids_with_multi_names, ids_with_multi_names as f64 / id_to_names.len() as f64 * 100.0);
+    eprintln!("  Max names per ID:   {:>10}", max_names_per_id);
+
+    // Show a few examples of renamed repos
+    if ids_with_multi_names > 0 {
+        eprintln!("  Examples of renamed repos:");
+        for (id, names) in id_to_names.iter().filter(|(_, v)| v.len() > 1).take(3) {
+            eprintln!("    ID {}: {:?}", id, names);
+        }
+    }
+
+    // For renamed repos, pick a "primary" name and count events needing disambiguation
+    let mut id_to_primary: HashMap<u32, &String> = HashMap::new();
+    let mut id_to_name_idx: HashMap<u32, HashMap<&String, u8>> = HashMap::new();
+    for (id, names) in &id_to_names {
+        // Primary = first alphabetically (deterministic)
+        let sorted_names: Vec<&String> = {
+            let mut v: Vec<&String> = names.iter().collect();
+            v.sort();
+            v
+        };
+        id_to_primary.insert(*id, sorted_names[0]);
+        let name_map: HashMap<&String, u8> = sorted_names.iter()
+            .enumerate()
+            .map(|(i, n)| (*n, i as u8))
+            .collect();
+        id_to_name_idx.insert(*id, name_map);
+    }
+
+    // Count events needing disambiguation (name_idx > 0)
+    // Re-parse TSV to get (id, name) pairs, then count
+    let mut events_with_primary = 0usize;
+    let mut events_with_alt = 0usize;
+    for line in tsv.lines() {
+        if line.is_empty() { continue; }
+        let mut parts = line.split('\t');
+        let id: u32 = parts.next().unwrap().parse().unwrap();
+        let name = parts.next().unwrap();
+        let name_idx = id_to_name_idx.get(&id)
+            .and_then(|m| m.get(&name.to_string()))
+            .copied()
+            .unwrap_or(0);
+        if name_idx == 0 {
+            events_with_primary += 1;
+        } else {
+            events_with_alt += 1;
+        }
+    }
+
+    // Note: This counts unique (id,name) pairs, not events. For events we'd need to
+    // weight by frequency. But this gives us a sense of the disambiguation needed.
+
+    eprintln!("\n=== Proposed FST + repo_id Format ===");
+    eprintln!("  (id,name) pairs using primary:    {:>8}", events_with_primary);
+    eprintln!("  (id,name) pairs using alt names:  {:>8} ({:.2}%)",
+        events_with_alt, events_with_alt as f64 / (events_with_primary + events_with_alt) as f64 * 100.0);
+
+    // Estimate new format size:
+    // - FST (name -> repo_id): 3.61 MB compressed (already calculated)
+    // - Per-event repo_id: num_rows * 4 bytes raw
+    let per_event_repo_ids_raw = num_rows * 4;
+    // For disambiguation: worst case is 1 extra byte per event with alt name
+    // But we'd need actual event counts, not pair counts. Estimate ~0.2% of events.
+    let estimated_disambig_events = (num_rows as f64 * 0.002) as usize;  // rough estimate
+    let disambig_overhead = estimated_disambig_events * 2;  // (event_idx, name_idx) sparse
+
+    // Check repo_id bit usage
+    let max_repo_id = id_to_names.keys().max().copied().unwrap_or(0);
+    let min_repo_id = id_to_names.keys().min().copied().unwrap_or(0);
+    let bits_needed = if max_repo_id > 0 { 32 - max_repo_id.leading_zeros() } else { 0 };
+
+    eprintln!("\n=== Repo ID Bit Analysis ===");
+    eprintln!("  Min repo_id:       {:>15}", min_repo_id);
+    eprintln!("  Max repo_id:       {:>15}", max_repo_id);
+    eprintln!("  Bits needed:       {:>15} (max variant needs 2 bits)", bits_needed);
+    eprintln!("  Spare bits in u64: {:>15}", 64 - bits_needed);
+    eprintln!("  Spare bits in u32: {:>15}", if bits_needed <= 32 { 32 - bits_needed } else { 0 });
+
+    // Proposed encoding: repo_id | (name_variant << 62) in u64
+    // Or if fits in u32: repo_id | (name_variant << 30)
+    if bits_needed <= 30 {
+        eprintln!("  -> Can encode (repo_id | variant<<30) in u32!");
+    } else if bits_needed <= 62 {
+        eprintln!("  -> Can encode (repo_id | variant<<62) in u64");
+    }
+
+    // Build FST with combined values: name -> (repo_id | variant<<30)
+    // Note: same name can belong to different repo_ids (repo transfers/forks)
+    // For FST, we need unique keys. We'll encode: name -> (repo_id | variant<<30)
+    // But if same name has multiple repo_ids, we can only store one.
+    // Count how many names have multiple repo_ids:
+    let mut name_to_ids: HashMap<&String, Vec<(u32, u8)>> = HashMap::new();
+    for (id, names) in &id_to_names {
+        let mut sorted_names: Vec<&String> = names.iter().collect();
+        sorted_names.sort();
+        for (variant, name) in sorted_names.iter().enumerate() {
+            name_to_ids.entry(name).or_default().push((*id, variant as u8));
+        }
+    }
+    let names_with_multi_ids = name_to_ids.values().filter(|v| v.len() > 1).count();
+    eprintln!("  Names with multi IDs: {:>10} (repo transfers)", names_with_multi_ids);
+
+    // For FST, use first (id, variant) per name
+    let mut fst_entries: Vec<(&String, u64)> = name_to_ids.iter()
+        .map(|(name, ids)| {
+            let (id, variant) = ids[0];
+            let combined = (id as u64) | ((variant as u64) << 30);
+            (*name, combined)
+        })
+        .collect();
+    fst_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Build new FST: name -> (repo_id | variant<<30)
+    let mut fst_builder2 = MapBuilder::memory();
+    for (name, combined) in &fst_entries {
+        fst_builder2.insert(*name, *combined).unwrap();
+    }
+    let fst_bytes2 = fst_builder2.into_inner().unwrap();
+    let fst2_compressed = zstd::encode_all(fst_bytes2.as_slice(), ZSTD_LEVEL).unwrap().len();
+
+    eprintln!("\n=== FST with Embedded Variant ===");
+    eprintln!("  FST entries:       {:>15}", fst_entries.len());
+    eprintln!("  FST raw:           {:>15} bytes", fst_bytes2.len());
+    eprintln!("  FST + zstd:        {:>15} bytes ({:.2} B/row)", fst2_compressed, fst2_compressed as f64 / num_rows as f64);
+
+    // Build idx -> combined lookup (TSV order matches pair_idx)
+    // Parse TSV to get combined value for each (id, name) pair in order
+    let mut idx_to_combined: Vec<u32> = Vec::new();
+    for line in tsv.lines() {
+        if line.is_empty() { continue; }
+        let mut parts = line.split('\t');
+        let id: u32 = parts.next().unwrap().parse().unwrap();
+        let name = parts.next().unwrap();
+        // Get variant for this (id, name) pair
+        let variant = id_to_name_idx.get(&id)
+            .and_then(|m| m.get(&name.to_string()))
+            .copied()
+            .unwrap_or(0);
+        let combined = id | ((variant as u32) << 30);
+        idx_to_combined.push(combined);
+    }
+
+    // Now build actual per-event combined values using current pair_idx
+    let per_event_combined: Vec<u32> = per_event_pair_idx.iter()
+        .map(|&idx| idx_to_combined[idx as usize])
+        .collect();
+
+    let combined_bytes: Vec<u8> = per_event_combined.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let combined_compressed = zstd::encode_all(combined_bytes.as_slice(), ZSTD_LEVEL).unwrap().len();
+
+    eprintln!("\n=== Per-Event Combined Value Compression ===");
+    eprintln!("  Per-event values:       {:>10}", per_event_combined.len());
+    eprintln!("  Combined raw (u32):     {:>10} bytes", per_event_combined.len() * 4);
+    eprintln!("  Combined + zstd:        {:>10} bytes ({:.2} B/row)", combined_compressed, combined_compressed as f64 / num_rows as f64);
+
+    // Compare totals
+    let current_total = tsv_compressed + 2316941;  // TSV + pair_idx
+    let proposed_total = fst2_compressed + combined_compressed;
+
+    eprintln!("\n=== Total Comparison ===");
+    eprintln!("  Current (TSV + pair_idx):    {:>10} bytes ({:.2} B/row)", current_total, current_total as f64 / num_rows as f64);
+    eprintln!("  Proposed (FST + combined):   {:>10} bytes ({:.2} B/row)", proposed_total, proposed_total as f64 / num_rows as f64);
+
+    if proposed_total < current_total {
+        eprintln!("  FST APPROACH WINS by {} bytes ({:.1}%)",
+            current_total - proposed_total,
+            (1.0 - proposed_total as f64 / current_total as f64) * 100.0);
+    } else {
+        eprintln!("  CURRENT APPROACH WINS by {} bytes ({:.1}%)",
+            proposed_total - current_total,
+            (1.0 - current_total as f64 / proposed_total as f64) * 100.0);
     }
 }
 
@@ -519,7 +718,7 @@ fn print_column_stats(columns: &EncodedColumns, mapping_tsv: &[u8], mapping_comp
     print_repo_pair_idx_analysis(&columns.repo_pair_indices);
 
     // FST vs TSV analysis
-    analyze_fst_vs_tsv(mapping_tsv, num_rows);
+    analyze_fst_vs_tsv(mapping_tsv, num_rows, &columns.repo_pair_indices);
     eprintln!();
 }
 
