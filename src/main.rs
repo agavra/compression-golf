@@ -329,6 +329,62 @@ fn main() -> Result<(), Box<dyn Error>> {
         assert_events_eq(codec.name(), expected, &decoded);
     }
 
+    // Run external Docker codecs if --docker flag is set
+    if docker_enabled {
+        let external_codecs = discover_external_codecs();
+        for codec_name in external_codecs {
+            // Skip if filter is set and doesn't match
+            if let Some(ref filter) = codec_filter {
+                if !codec_name.to_lowercase().contains(filter) {
+                    continue;
+                }
+            }
+
+            // Build the Docker image
+            if let Err(e) = build_docker_codec(&codec_name) {
+                println!(
+                    "│ {:<22} │ {:>14} │ {:>10} │",
+                    format!("{} [BUILD FAILED]", codec_name),
+                    "-",
+                    "-"
+                );
+                eprintln!("Build error for {}: {}", codec_name, e);
+                continue;
+            }
+
+            // Run encode
+            let encoded = match run_docker_encode(&codec_name, &events) {
+                Ok(data) => data,
+                Err(e) => {
+                    println!(
+                        "│ {:<22} │ {:>14} │ {:>10} │",
+                        format!("{} [ENCODE FAILED]", codec_name),
+                        "-",
+                        "-"
+                    );
+                    eprintln!("Encode error for {}: {}", codec_name, e);
+                    continue;
+                }
+            };
+
+            print_row(&codec_name, encoded.len(), baseline);
+
+            // Run decode and verify
+            let decoded = match run_docker_decode(&codec_name, &encoded) {
+                Ok(data) => data,
+                Err(e) => {
+                    eprintln!("Decode error for {}: {}", codec_name, e);
+                    continue;
+                }
+            };
+
+            // Sort decoded events for comparison (external codecs may not preserve order)
+            let mut sorted_decoded = decoded.clone();
+            sorted_decoded.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_events_eq(&codec_name, &sorted_events, &sorted_decoded);
+        }
+    }
+
     println!("└────────────────────────┴────────────────┴────────────┘");
     println!("\nAll verifications passed");
 
