@@ -81,7 +81,10 @@ impl StringDict {
             str_to_idx.insert(s.clone(), i as u32);
         }
 
-        Self { strings: unique, str_to_idx }
+        Self {
+            strings: unique,
+            str_to_idx,
+        }
     }
 
     fn encode(&self, buf: &mut Vec<u8>) {
@@ -114,7 +117,10 @@ impl StringDict {
             strings.push(s);
         }
 
-        Self { strings, str_to_idx }
+        Self {
+            strings,
+            str_to_idx,
+        }
     }
 
     fn get_index(&self, s: &str) -> u32 {
@@ -166,7 +172,9 @@ impl TypeEnum {
 
         for i in 0..type_count {
             let len = decode_varint(bytes, pos) as usize;
-            let t = std::str::from_utf8(&bytes[*pos..*pos + len]).unwrap().to_string();
+            let t = std::str::from_utf8(&bytes[*pos..*pos + len])
+                .unwrap()
+                .to_string();
             *pos += len;
             type_to_idx.insert(t.clone(), i as u8);
             types.push(t);
@@ -204,7 +212,10 @@ impl RepoDict {
             tuple_to_idx.insert(*tuple, i as u32);
         }
 
-        Self { tuples: unique, tuple_to_idx }
+        Self {
+            tuples: unique,
+            tuple_to_idx,
+        }
     }
 
     fn encode(&self, buf: &mut Vec<u8>) {
@@ -232,7 +243,10 @@ impl RepoDict {
             tuples.push(tuple);
         }
 
-        Self { tuples, tuple_to_idx }
+        Self {
+            tuples,
+            tuple_to_idx,
+        }
     }
 
     fn get_index(&self, repo_id: u64, name_idx: u32) -> u32 {
@@ -483,7 +497,9 @@ fn encode_signed_varints(values: &[i64], buf: &mut Vec<u8>) {
 }
 
 fn decode_signed_varints(bytes: &[u8], pos: &mut usize, count: usize) -> Vec<i64> {
-    (0..count).map(|_| decode_signed_varint(bytes, pos)).collect()
+    (0..count)
+        .map(|_| decode_signed_varint(bytes, pos))
+        .collect()
 }
 
 /// Encode timestamp deltas using 2-bit categories + exceptions
@@ -668,7 +684,9 @@ impl EventCodec for HachikujiCodec {
 
         for i in 0..event_count {
             if type_marker_idx < type_markers.len() && type_markers[type_marker_idx].0 == i {
-                current_type = type_enum.get_type(type_markers[type_marker_idx].1).to_string();
+                current_type = type_enum
+                    .get_type(type_markers[type_marker_idx].1)
+                    .to_string();
                 type_marker_idx += 1;
             }
 
