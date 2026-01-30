@@ -182,6 +182,85 @@ fn build_docker_codec(name: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn run_docker_encode(image: &str, events: &[(EventKey, EventValue)]) -> Result<Vec<u8>, Box<dyn Error>> {
+    use std::io::Write;
+
+    let mut child = std::process::Command::new("docker")
+        .args(["run", "-i", "--rm", image, "encode"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    // Write events as line-delimited JSON to stdin
+    {
+        let stdin = child.stdin.as_mut().ok_or("Failed to open stdin")?;
+        for (key, value) in events {
+            let event = serde_json::json!({
+                "id": key.id,
+                "type": key.event_type,
+                "repo": value.repo,
+                "created_at": value.created_at
+            });
+            writeln!(stdin, "{}", serde_json::to_string(&event)?)?;
+        }
+    }
+
+    let output = child.wait_with_output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Encode failed: {}", stderr).into());
+    }
+
+    Ok(output.stdout)
+}
+
+fn run_docker_decode(image: &str, data: &[u8]) -> Result<Vec<(EventKey, EventValue)>, Box<dyn Error>> {
+    use std::io::Write;
+
+    let mut child = std::process::Command::new("docker")
+        .args(["run", "-i", "--rm", image, "decode"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    {
+        let stdin = child.stdin.as_mut().ok_or("Failed to open stdin")?;
+        stdin.write_all(data)?;
+    }
+
+    let output = child.wait_with_output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Decode failed: {}", stderr).into());
+    }
+
+    // Parse line-delimited JSON from stdout
+    let stdout = String::from_utf8(output.stdout)?;
+    let mut events = Vec::new();
+
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let raw: RawGitHubEvent = serde_json::from_str(line)?;
+        let key = EventKey {
+            event_type: raw.event_type,
+            id: raw.id,
+        };
+        let value = EventValue {
+            repo: raw.repo,
+            created_at: raw.created_at,
+        };
+        events.push((key, value));
+    }
+
+    Ok(events)
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
 
