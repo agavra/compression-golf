@@ -66,6 +66,10 @@
 //!   - Delta encoding for repo_pair_idx: Repos are essentially random when sorted
 //!     by event_id (99.6% runs of length 1). Deltas span full range (-262K to +262K),
 //!     only 26% fit in i16. Would use 3.47MB vs zstd's 2.32MB.
+//!   - FST (finite state transducer) for repo mapping: FST compresses repo names
+//!     well (5.78MB raw vs 9.37MB TSV), and FST+zstd (3.61MB) beats TSV+zstd (3.78MB).
+//!     But FST only stores name->idx, not repo_ids. Adding repo_ids separately
+//!     (1.01MB compressed) makes total 4.62MB, worse than TSV's 3.78MB.
 //!
 //! Current results (1M events):
 //!   - event_type:       0.22 B/row (4-bit packed)
@@ -79,6 +83,7 @@
 
 use bytes::Bytes;
 use chrono::DateTime;
+use fst::MapBuilder;
 use std::collections::HashMap;
 use std::error::Error;
 
@@ -217,7 +222,7 @@ fn print_event_type_distribution(dict: &[u8], indices: &[u8]) {
     // Simple Huffman estimate: assign bit lengths based on frequency
     // Sort by frequency, assign codes using canonical Huffman-like approach
     let mut huffman_bits = 0.0;
-    for (i, (_, _, count)) in freq.iter().enumerate() {
+    for (_, _, count) in freq.iter() {
         // Approximate bit length: ceil(log2(total/count)) but min 1
         let p = *count as f64 / total;
         let bits = if p >= 0.5 { 1.0 } else { (-p.log2()).ceil().min(8.0) };
@@ -335,7 +340,75 @@ fn print_repo_pair_idx_analysis(indices: &[u32]) {
     eprintln!("\n  Varint estimate: {:>8} bytes (vs {} raw u32)", varint_bytes, total * 4);
 }
 
-fn print_column_stats(columns: &EncodedColumns, mapping_tsv_raw: usize, mapping_compressed_size: usize) {
+/// Analyze FST vs TSV for repo mapping
+fn analyze_fst_vs_tsv(mapping_tsv: &[u8], num_rows: usize) {
+    // Parse TSV to get repo names and ids
+    let tsv = std::str::from_utf8(mapping_tsv).unwrap();
+    let mut entries: Vec<(String, u32)> = Vec::new();
+
+    for line in tsv.lines() {
+        if line.is_empty() { continue; }
+        let mut parts = line.split('\t');
+        let id: u32 = parts.next().unwrap().parse().unwrap();
+        let name = parts.next().unwrap().to_string();
+        entries.push((name, id));
+    }
+
+    let num_repos = entries.len();
+
+    // Sort by name for FST (FST requires lexicographic order)
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Deduplicate by name (keep first occurrence of each name)
+    entries.dedup_by(|a, b| a.0 == b.0);
+    let num_unique_names = entries.len();
+
+    // Build FST for repo names -> index
+    let mut fst_builder = MapBuilder::memory();
+    for (sorted_idx, (name, _id)) in entries.iter().enumerate() {
+        fst_builder.insert(name, sorted_idx as u64).unwrap();
+    }
+    let fst_bytes = fst_builder.into_inner().unwrap();
+
+    // Repo IDs in sorted-by-name order
+    let repo_ids: Vec<u32> = entries.iter().map(|(_, id)| *id).collect();
+
+    // Calculate sizes
+    let repo_ids_raw = num_repos * 4;  // u32 per repo
+    let repo_ids_compressed = zstd::encode_all(
+        repo_ids.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>().as_slice(),
+        ZSTD_LEVEL
+    ).unwrap().len();
+
+    let fst_compressed = zstd::encode_all(fst_bytes.as_slice(), ZSTD_LEVEL).unwrap().len();
+    let tsv_compressed = zstd::encode_all(mapping_tsv, ZSTD_LEVEL).unwrap().len();
+
+    eprintln!("\n=== FST vs TSV Analysis ===");
+    eprintln!("  Num (id,name) pairs:{:>8}", num_repos);
+    eprintln!("  Unique names:     {:>10} ({} duplicates)", num_unique_names, num_repos - num_unique_names);
+    eprintln!("  TSV raw:          {:>10} bytes", mapping_tsv.len());
+    eprintln!("  TSV + zstd:       {:>10} bytes ({:.2} B/row)", tsv_compressed, tsv_compressed as f64 / num_rows as f64);
+    eprintln!("  FST raw:          {:>10} bytes", fst_bytes.len());
+    eprintln!("  FST + zstd:       {:>10} bytes ({:.2} B/row)", fst_compressed, fst_compressed as f64 / num_rows as f64);
+    eprintln!("  repo_ids raw:     {:>10} bytes", repo_ids_raw);
+    eprintln!("  repo_ids + zstd:  {:>10} bytes ({:.2} B/row)", repo_ids_compressed, repo_ids_compressed as f64 / num_rows as f64);
+    eprintln!("  FST + ids total:  {:>10} bytes ({:.2} B/row)",
+        fst_compressed + repo_ids_compressed,
+        (fst_compressed + repo_ids_compressed) as f64 / num_rows as f64);
+
+    let fst_total = fst_compressed + repo_ids_compressed;
+    if fst_total < tsv_compressed {
+        eprintln!("  FST WINS by {} bytes ({:.1}%)",
+            tsv_compressed - fst_total,
+            (1.0 - fst_total as f64 / tsv_compressed as f64) * 100.0);
+    } else {
+        eprintln!("  TSV WINS by {} bytes ({:.1}%)",
+            fst_total - tsv_compressed,
+            (1.0 - tsv_compressed as f64 / fst_total as f64) * 100.0);
+    }
+}
+
+fn print_column_stats(columns: &EncodedColumns, mapping_tsv: &[u8], mapping_compressed_size: usize) {
     let num_rows = columns.event_id_deltas.len();  // 1 per event
     eprintln!("\n=== Per-Column Compressed Size Estimates ===");
     eprintln!("Total rows: {}", num_rows);
@@ -409,6 +482,7 @@ fn print_column_stats(columns: &EncodedColumns, mapping_tsv_raw: usize, mapping_
     );
 
     // mapping
+    let mapping_tsv_raw = mapping_tsv.len();
     total_raw += mapping_tsv_raw;
     total_compressed += mapping_compressed_size;
     eprintln!(
@@ -443,6 +517,9 @@ fn print_column_stats(columns: &EncodedColumns, mapping_tsv_raw: usize, mapping_
 
     // Repo pair index analysis
     print_repo_pair_idx_analysis(&columns.repo_pair_indices);
+
+    // FST vs TSV analysis
+    analyze_fst_vs_tsv(mapping_tsv, num_rows);
     eprintln!();
 }
 
@@ -782,7 +859,7 @@ impl EventCodec for NatebrennandCodec {
             eprintln!("  event_type_dict_size: {}", header.event_type_dict_size);
             eprintln!("  num_event_types:      {}", header.num_event_types);
 
-            print_column_stats(&columns, mapping_tsv.len(), mapping_compressed_size);
+            print_column_stats(&columns, &mapping_tsv, mapping_compressed_size);
         }
 
         // Build uncompressed payload:
