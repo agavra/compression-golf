@@ -109,6 +109,126 @@ use crate::{EventKey, EventValue, Repo};
 
 const ZSTD_LEVEL: i32 = 22;
 
+/// Compress with custom zstd parameters
+fn compress_with_params(data: &[u8], level: i32, window_log: Option<u32>, pledged_size: bool, checksum: bool) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = zstd::Encoder::new(Vec::new(), level).unwrap();
+
+    if let Some(wl) = window_log {
+        encoder.set_parameter(zstd::zstd_safe::CParameter::WindowLog(wl)).ok();
+    }
+    if pledged_size {
+        encoder.set_pledged_src_size(Some(data.len() as u64)).ok();
+    }
+    encoder.include_checksum(checksum).ok();
+
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// Experiment with different zstd compression approaches
+fn experiment_compression_strategies(
+    mapping_tsv: &[u8],
+    event_type_dict: &[u8],
+    event_type_packed: &[u8],
+    event_id_deltas: &[u8],
+    repo_bytes: &[u8],
+    ts_bytes: &[u8],
+) {
+    eprintln!("\n=== Compression Strategy Experiments ===");
+
+    // Raw sizes
+    let columns: Vec<(&str, &[u8])> = vec![
+        ("mapping_tsv", mapping_tsv),
+        ("event_type_dict", event_type_dict),
+        ("event_type_packed", event_type_packed),
+        ("event_id_deltas", event_id_deltas),
+        ("repo_pair_idx", repo_bytes),
+        ("created_at_delta", ts_bytes),
+    ];
+
+    let total_raw: usize = columns.iter().map(|(_, d)| d.len()).sum();
+    eprintln!("Total raw: {} bytes", total_raw);
+
+    // Baseline: per-column with default settings
+    let baseline: usize = columns.iter()
+        .map(|(_, d)| zstd::encode_all(*d, ZSTD_LEVEL).unwrap().len())
+        .sum();
+    eprintln!("\nBaseline (per-column L22): {:>10} bytes", baseline);
+
+    // Strategy 1: Window log experiments (per-column)
+    eprintln!("\n1. Window log experiments (per-column):");
+    for window_log in [17, 20, 23, 25, 27, 30] {
+        let total: usize = columns.iter()
+            .map(|(_, d)| compress_with_params(d, ZSTD_LEVEL, Some(window_log), false, false).len())
+            .sum();
+        eprintln!("   window_log={:<2}:          {:>10} bytes ({:+} vs baseline)",
+            window_log, total, total as i64 - baseline as i64);
+    }
+
+    // Strategy 2: Pledged source size
+    eprintln!("\n2. Pledged source size (per-column):");
+    let with_pledged: usize = columns.iter()
+        .map(|(_, d)| compress_with_params(d, ZSTD_LEVEL, None, true, false).len())
+        .sum();
+    eprintln!("   with pledged size:      {:>10} bytes ({:+} vs baseline)",
+        with_pledged, with_pledged as i64 - baseline as i64);
+
+    // Strategy 3: Checksum (should add overhead)
+    eprintln!("\n3. Checksum overhead:");
+    let with_checksum: usize = columns.iter()
+        .map(|(_, d)| compress_with_params(d, ZSTD_LEVEL, None, false, true).len())
+        .sum();
+    eprintln!("   with checksum:          {:>10} bytes ({:+} vs baseline)",
+        with_checksum, with_checksum as i64 - baseline as i64);
+
+    // Strategy 4: Combined optimizations
+    eprintln!("\n4. Combined parameter tuning:");
+    for window_log in [23, 25, 27] {
+        let total: usize = columns.iter()
+            .map(|(_, d)| compress_with_params(d, ZSTD_LEVEL, Some(window_log), true, false).len())
+            .sum();
+        eprintln!("   wlog={} + pledged:      {:>10} bytes ({:+} vs baseline)",
+            window_log, total, total as i64 - baseline as i64);
+    }
+
+    // Strategy 5: Per-column optimal window_log
+    eprintln!("\n5. Per-column optimal window_log:");
+    let mut optimized_total = 0usize;
+    for (name, data) in &columns {
+        let mut best_size = usize::MAX;
+        let mut best_wlog = 0u32;
+        for wlog in [17, 20, 23, 25, 27] {
+            let size = compress_with_params(data, ZSTD_LEVEL, Some(wlog), true, false).len();
+            if size < best_size {
+                best_size = size;
+                best_wlog = wlog;
+            }
+        }
+        let default_size = zstd::encode_all(*data, ZSTD_LEVEL).unwrap().len();
+        eprintln!("   {:<20} best wlog={:<2}: {:>8} bytes ({:+} vs default)",
+            name, best_wlog, best_size, best_size as i64 - default_size as i64);
+        optimized_total += best_size;
+    }
+    eprintln!("   Optimized total:        {:>10} bytes ({:+} vs baseline)",
+        optimized_total, optimized_total as i64 - baseline as i64);
+
+    // Strategy 6: Higher compression levels with larger window
+    eprintln!("\n6. High compression with large window (single combined):");
+    let mut combined = Vec::with_capacity(total_raw);
+    for (_, data) in &columns {
+        combined.extend_from_slice(data);
+    }
+    for level in [19, 22] {
+        for wlog in [25, 27, 30] {
+            let size = compress_with_params(&combined, level, Some(wlog), true, false).len();
+            let baseline_combined = zstd::encode_all(combined.as_slice(), ZSTD_LEVEL).unwrap().len();
+            eprintln!("   L{} wlog={}:             {:>10} bytes ({:+} vs L22 default)",
+                level, wlog, size, size as i64 - baseline_combined as i64);
+        }
+    }
+}
+
 pub struct NatebrennandCodec;
 
 impl NatebrennandCodec {
@@ -743,46 +863,117 @@ fn format_timestamp(ts: i64) -> String {
         .unwrap_or_default()
 }
 
-/// Header: first_event_id (u64) + first_timestamp (i64) + mapping_size (u32)
-///       + num_events (u32) + event_type_dict_size (u16) + num_event_types (u8) + padding (u8)
+/// Header for per-column compressed format
+/// Base fields (28 bytes):
+///   - first_event_id: u64
+///   - first_timestamp: i64
+///   - num_events: u32
+///   - mapping_size: u32 (uncompressed TSV size)
+///   - event_type_dict_size: u16 (uncompressed)
+///   - num_event_types: u8
+///   - _padding: u8
+/// Compressed sizes (24 bytes):
+///   - mapping_compressed: u32
+///   - dict_compressed: u32
+///   - packed_compressed: u32
+///   - id_deltas_compressed: u32
+///   - repo_compressed: u32
+///   - ts_compressed: u32
 struct Header {
     first_event_id: u64,
     first_timestamp: i64,
-    mapping_size: u32,
     num_events: u32,
+    mapping_size: u32,
     event_type_dict_size: u16,
     num_event_types: u8,
+    // Compressed sizes for each column
+    mapping_compressed: u32,
+    dict_compressed: u32,
+    packed_compressed: u32,
+    id_deltas_compressed: u32,
+    repo_compressed: u32,
+    ts_compressed: u32,
 }
 
-const HEADER_SIZE: usize = 28; // 8 + 8 + 4 + 4 + 2 + 1 + 1
+const HEADER_SIZE: usize = 52; // 8 + 8 + 4 + 4 + 2 + 1 + 1 + (6 * 4)
 
 impl Header {
     fn encode(&self) -> [u8; HEADER_SIZE] {
         let mut buf = [0u8; HEADER_SIZE];
-        buf[0..8].copy_from_slice(&self.first_event_id.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.first_timestamp.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.mapping_size.to_le_bytes());
-        buf[20..24].copy_from_slice(&self.num_events.to_le_bytes());
-        buf[24..26].copy_from_slice(&self.event_type_dict_size.to_le_bytes());
-        buf[26] = self.num_event_types;
-        // buf[27] is padding
+        let mut pos = 0;
+
+        buf[pos..pos+8].copy_from_slice(&self.first_event_id.to_le_bytes());
+        pos += 8;
+        buf[pos..pos+8].copy_from_slice(&self.first_timestamp.to_le_bytes());
+        pos += 8;
+        buf[pos..pos+4].copy_from_slice(&self.num_events.to_le_bytes());
+        pos += 4;
+        buf[pos..pos+4].copy_from_slice(&self.mapping_size.to_le_bytes());
+        pos += 4;
+        buf[pos..pos+2].copy_from_slice(&self.event_type_dict_size.to_le_bytes());
+        pos += 2;
+        buf[pos] = self.num_event_types;
+        pos += 1;
+        // padding byte
+        pos += 1;
+
+        // Compressed sizes
+        buf[pos..pos+4].copy_from_slice(&self.mapping_compressed.to_le_bytes());
+        pos += 4;
+        buf[pos..pos+4].copy_from_slice(&self.dict_compressed.to_le_bytes());
+        pos += 4;
+        buf[pos..pos+4].copy_from_slice(&self.packed_compressed.to_le_bytes());
+        pos += 4;
+        buf[pos..pos+4].copy_from_slice(&self.id_deltas_compressed.to_le_bytes());
+        pos += 4;
+        buf[pos..pos+4].copy_from_slice(&self.repo_compressed.to_le_bytes());
+        pos += 4;
+        buf[pos..pos+4].copy_from_slice(&self.ts_compressed.to_le_bytes());
+
         buf
     }
 
     fn decode(bytes: &[u8]) -> Self {
-        let first_event_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-        let first_timestamp = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        let mapping_size = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
-        let num_events = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
-        let event_type_dict_size = u16::from_le_bytes(bytes[24..26].try_into().unwrap());
-        let num_event_types = bytes[26];
+        let mut pos = 0;
+
+        let first_event_id = u64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap());
+        pos += 8;
+        let first_timestamp = i64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap());
+        pos += 8;
+        let num_events = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        pos += 4;
+        let mapping_size = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        pos += 4;
+        let event_type_dict_size = u16::from_le_bytes(bytes[pos..pos+2].try_into().unwrap());
+        pos += 2;
+        let num_event_types = bytes[pos];
+        pos += 2; // skip num_event_types + padding
+
+        let mapping_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        pos += 4;
+        let dict_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        pos += 4;
+        let packed_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        pos += 4;
+        let id_deltas_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        pos += 4;
+        let repo_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        pos += 4;
+        let ts_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+
         Self {
             first_event_id,
             first_timestamp,
-            mapping_size,
             num_events,
+            mapping_size,
             event_type_dict_size,
             num_event_types,
+            mapping_compressed,
+            dict_compressed,
+            packed_compressed,
+            id_deltas_compressed,
+            repo_compressed,
+            ts_compressed,
         }
     }
 }
@@ -942,7 +1133,8 @@ fn build_event_type_dict(event_types: &[&str]) -> (Vec<u8>, Vec<u8>, HashMap<Str
     (dict_bytes, indices, str_to_idx)
 }
 
-fn encode_events(events: &[(EventKey, EventValue)]) -> Result<(Header, Vec<u8>, EncodedColumns), Box<dyn Error>> {
+/// Returns (base_info, mapping_tsv, columns) where base_info is (first_event_id, first_timestamp, num_events, mapping_size, num_event_types)
+fn encode_events(events: &[(EventKey, EventValue)]) -> Result<((u64, i64, u32, u32, u8), Vec<u8>, EncodedColumns), Box<dyn Error>> {
     // Build mapping table first
     let (mapping_tsv, pair_to_idx) = build_mapping_table(events);
 
@@ -980,16 +1172,6 @@ fn encode_events(events: &[(EventKey, EventValue)]) -> Result<(Header, Vec<u8>, 
     let event_id_deltas = compute_u8_deltas(&event_ids);
     let created_at_deltas = compute_i16_deltas(&timestamps);
 
-    // Create header
-    let header = Header {
-        first_event_id: event_ids[0],
-        first_timestamp: timestamps[0],
-        mapping_size: mapping_tsv.len() as u32,
-        num_events: events.len() as u32,
-        event_type_dict_size: event_type_dict.len() as u16,
-        num_event_types,
-    };
-
     let columns = EncodedColumns {
         event_type_dict,
         event_type_packed: pack_nibbles(&event_type_indices),
@@ -998,7 +1180,16 @@ fn encode_events(events: &[(EventKey, EventValue)]) -> Result<(Header, Vec<u8>, 
         created_at_deltas,
     };
 
-    Ok((header, mapping_tsv, columns))
+    // Return base header info (compressed sizes filled in later)
+    let base_info = (
+        event_ids[0],           // first_event_id
+        timestamps[0],          // first_timestamp
+        events.len() as u32,    // num_events
+        mapping_tsv.len() as u32, // mapping_size (uncompressed)
+        num_event_types,
+    );
+
+    Ok((base_info, mapping_tsv, columns))
 }
 
 /// Decode events from raw column data
@@ -1053,10 +1244,47 @@ impl EventCodec for NatebrennandCodec {
     }
 
     fn encode(&self, events: &[(EventKey, EventValue)]) -> Result<Bytes, Box<dyn Error>> {
-        let (header, mapping_tsv, columns) = encode_events(events)?;
+        let (base_info, mapping_tsv, columns) = encode_events(events)?;
+        let (first_event_id, first_timestamp, num_events, mapping_size, num_event_types) = base_info;
 
-        // Compute mapping compressed size for stats
-        let mapping_compressed_size = zstd::encode_all(mapping_tsv.as_slice(), ZSTD_LEVEL)?.len();
+        // Convert columns to bytes
+        let repo_bytes: Vec<u8> = columns.repo_pair_indices.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let ts_bytes: Vec<u8> = columns.created_at_deltas.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        if debug_enabled() {
+            experiment_compression_strategies(
+                &mapping_tsv,
+                &columns.event_type_dict,
+                &columns.event_type_packed,
+                &columns.event_id_deltas,
+                &repo_bytes,
+                &ts_bytes,
+            );
+        }
+
+        // Compress each column separately
+        let mapping_compressed = zstd::encode_all(mapping_tsv.as_slice(), ZSTD_LEVEL)?;
+        let dict_compressed = zstd::encode_all(columns.event_type_dict.as_slice(), ZSTD_LEVEL)?;
+        let packed_compressed = zstd::encode_all(columns.event_type_packed.as_slice(), ZSTD_LEVEL)?;
+        let id_deltas_compressed = zstd::encode_all(columns.event_id_deltas.as_slice(), ZSTD_LEVEL)?;
+        let repo_compressed = zstd::encode_all(repo_bytes.as_slice(), ZSTD_LEVEL)?;
+        let ts_compressed = zstd::encode_all(ts_bytes.as_slice(), ZSTD_LEVEL)?;
+
+        // Build header with compressed sizes
+        let header = Header {
+            first_event_id,
+            first_timestamp,
+            num_events,
+            mapping_size,
+            event_type_dict_size: columns.event_type_dict.len() as u16,
+            num_event_types,
+            mapping_compressed: mapping_compressed.len() as u32,
+            dict_compressed: dict_compressed.len() as u32,
+            packed_compressed: packed_compressed.len() as u32,
+            id_deltas_compressed: id_deltas_compressed.len() as u32,
+            repo_compressed: repo_compressed.len() as u32,
+            ts_compressed: ts_compressed.len() as u32,
+        };
 
         if debug_enabled() {
             eprintln!("\n=== Header ({HEADER_SIZE} bytes) ===");
@@ -1067,44 +1295,35 @@ impl EventCodec for NatebrennandCodec {
             eprintln!("  event_type_dict_size: {}", header.event_type_dict_size);
             eprintln!("  num_event_types:      {}", header.num_event_types);
 
-            print_column_stats(&columns, &mapping_tsv, mapping_compressed_size);
+            print_column_stats(&columns, &mapping_tsv, mapping_compressed.len());
         }
 
-        // Build uncompressed payload:
-        // - mapping TSV
-        // - event_type dict (newline-separated)
-        // - event_type indices
-        // - event_id deltas
-        // - repo_pair_indices (as le bytes)
-        // - created_at deltas (as le bytes)
-        let repo_bytes: Vec<u8> = columns.repo_pair_indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let ts_bytes: Vec<u8> = columns.created_at_deltas.iter().flat_map(|v| v.to_le_bytes()).collect();
+        // Final output: header + compressed columns (concatenated)
+        let total_compressed = mapping_compressed.len()
+            + dict_compressed.len()
+            + packed_compressed.len()
+            + id_deltas_compressed.len()
+            + repo_compressed.len()
+            + ts_compressed.len();
 
-        let payload_size = mapping_tsv.len()
-            + columns.event_type_dict.len()
-            + columns.event_type_packed.len()
-            + columns.event_id_deltas.len()
-            + repo_bytes.len()
-            + ts_bytes.len();
-
-        let mut uncompressed = Vec::with_capacity(payload_size);
-        uncompressed.extend_from_slice(&mapping_tsv);
-        uncompressed.extend_from_slice(&columns.event_type_dict);
-        uncompressed.extend_from_slice(&columns.event_type_packed);
-        uncompressed.extend_from_slice(&columns.event_id_deltas);
-        uncompressed.extend_from_slice(&repo_bytes);
-        uncompressed.extend_from_slice(&ts_bytes);
-
-        let compressed = zstd::encode_all(uncompressed.as_slice(), ZSTD_LEVEL)?;
-
-        // Final output: header + compressed payload
-        let mut buf = Vec::with_capacity(HEADER_SIZE + compressed.len());
+        let mut buf = Vec::with_capacity(HEADER_SIZE + total_compressed);
         buf.extend_from_slice(&header.encode());
-        buf.extend_from_slice(&compressed);
+        buf.extend_from_slice(&mapping_compressed);
+        buf.extend_from_slice(&dict_compressed);
+        buf.extend_from_slice(&packed_compressed);
+        buf.extend_from_slice(&id_deltas_compressed);
+        buf.extend_from_slice(&repo_compressed);
+        buf.extend_from_slice(&ts_compressed);
 
         if debug_enabled() {
+            let payload_size = mapping_tsv.len()
+                + columns.event_type_dict.len()
+                + columns.event_type_packed.len()
+                + columns.event_id_deltas.len()
+                + repo_bytes.len()
+                + ts_bytes.len();
             eprintln!("Uncompressed payload: {payload_size} bytes");
-            eprintln!("Compressed size (zstd {}): {} bytes", ZSTD_LEVEL, buf.len());
+            eprintln!("Compressed size (per-column zstd {}): {} bytes", ZSTD_LEVEL, buf.len());
             eprintln!("Compressed bytes/row: {:.2}", buf.len() as f64 / events.len() as f64);
         }
 
@@ -1114,46 +1333,48 @@ impl EventCodec for NatebrennandCodec {
     fn decode(&self, bytes: &[u8]) -> Result<Vec<(EventKey, EventValue)>, Box<dyn Error>> {
         let header = Header::decode(&bytes[0..HEADER_SIZE]);
 
-        // Decompress
-        let decompressed = zstd::decode_all(&bytes[HEADER_SIZE..])?;
-
-        // Parse sections from decompressed payload
-        let mut offset = 0;
+        // Decompress each column separately using sizes from header
+        let mut offset = HEADER_SIZE;
 
         // 1. Mapping TSV
-        let mapping_bytes = &decompressed[offset..offset + header.mapping_size as usize];
-        offset += header.mapping_size as usize;
-        let mapping = parse_mapping_table(mapping_bytes);
+        let mapping_compressed = &bytes[offset..offset + header.mapping_compressed as usize];
+        offset += header.mapping_compressed as usize;
+        let mapping_bytes = zstd::decode_all(mapping_compressed)?;
+        let mapping = parse_mapping_table(&mapping_bytes);
 
         // 2. Event type dictionary
-        let dict_bytes = &decompressed[offset..offset + header.event_type_dict_size as usize];
-        offset += header.event_type_dict_size as usize;
-        let event_type_dict: Vec<String> = std::str::from_utf8(dict_bytes)?
+        let dict_compressed = &bytes[offset..offset + header.dict_compressed as usize];
+        offset += header.dict_compressed as usize;
+        let dict_bytes = zstd::decode_all(dict_compressed)?;
+        let event_type_dict: Vec<String> = std::str::from_utf8(&dict_bytes)?
             .split('\n')
             .map(|s| s.to_string())
             .collect();
 
-        // 3. Event type indices (4-bit packed, 2 per byte)
+        // 3. Event type indices (4-bit packed)
+        let packed_compressed = &bytes[offset..offset + header.packed_compressed as usize];
+        offset += header.packed_compressed as usize;
+        let packed_bytes = zstd::decode_all(packed_compressed)?;
         let num_events = header.num_events as usize;
-        let packed_size = (num_events + 1) / 2;
-        let event_type_packed = &decompressed[offset..offset + packed_size];
-        offset += packed_size;
-        let event_type_indices = unpack_nibbles(event_type_packed, num_events);
+        let event_type_indices = unpack_nibbles(&packed_bytes, num_events);
 
         // 4. Event ID deltas
-        let event_id_deltas = &decompressed[offset..offset + num_events];
-        offset += num_events;
+        let id_deltas_compressed = &bytes[offset..offset + header.id_deltas_compressed as usize];
+        offset += header.id_deltas_compressed as usize;
+        let event_id_deltas = zstd::decode_all(id_deltas_compressed)?;
 
         // 5. Repo pair indices (u32 le)
-        let repo_bytes = &decompressed[offset..offset + num_events * 4];
-        offset += num_events * 4;
+        let repo_compressed = &bytes[offset..offset + header.repo_compressed as usize];
+        offset += header.repo_compressed as usize;
+        let repo_bytes = zstd::decode_all(repo_compressed)?;
         let repo_pair_indices: Vec<u32> = repo_bytes
             .chunks_exact(4)
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
 
         // 6. Created at deltas (i16 le)
-        let ts_bytes = &decompressed[offset..offset + num_events * 2];
+        let ts_compressed = &bytes[offset..offset + header.ts_compressed as usize];
+        let ts_bytes = zstd::decode_all(ts_compressed)?;
         let created_at_deltas: Vec<i16> = ts_bytes
             .chunks_exact(2)
             .map(|chunk| i16::from_le_bytes(chunk.try_into().unwrap()))
@@ -1165,7 +1386,7 @@ impl EventCodec for NatebrennandCodec {
             &mapping,
             &event_type_dict,
             &event_type_indices,
-            event_id_deltas,
+            &event_id_deltas,
             &repo_pair_indices,
             &created_at_deltas,
         );
