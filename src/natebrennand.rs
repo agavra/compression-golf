@@ -1,7 +1,15 @@
 //! Hand-rolled columnar codec with TSV mapping table for repo info.
 //!
+//! Data ordering:
+//!   Events are sorted by event_id (ascending, parsed as u64) before storage.
+//!   This ordering is critical for compression because:
+//!   - event_id is sequential, so deltas between adjacent IDs are small (max 251)
+//!   - created_at timestamps are correlated with event_id, so deltas stay small
+//!   - Small deltas compress extremely well with zstd
+//!
+//!   On decode, events are re-sorted by EventKey to match expected output order.
+//!
 //! Strategy:
-//! - Sort by event_id for optimal delta encoding
 //! - Dictionary encode event_type (14 unique values)
 //! - Store unique (repo_id, repo_name) pairs in a TSV mapping table (compressed once)
 //! - Per event, store only an index into the mapping table
@@ -52,7 +60,44 @@ fn debug_enabled() -> bool {
     std::env::var("NATE_DEBUG").is_ok()
 }
 
-fn print_column_stats(columns: &EncodedColumns, mapping_compressed_size: usize) {
+/// Print value statistics for a column: min, max, and % fitting in each bit width
+fn print_value_stats_unsigned(name: &str, values: &[u64]) {
+    if values.is_empty() {
+        return;
+    }
+    let min = *values.iter().min().unwrap();
+    let max = *values.iter().max().unwrap();
+    let count = values.len() as f64;
+
+    let fits_8 = values.iter().filter(|&&v| v <= u8::MAX as u64).count() as f64 / count * 100.0;
+    let fits_16 = values.iter().filter(|&&v| v <= u16::MAX as u64).count() as f64 / count * 100.0;
+    let fits_32 = values.iter().filter(|&&v| v <= u32::MAX as u64).count() as f64 / count * 100.0;
+
+    eprintln!(
+        "  {:<18} min={:<12} max={:<12} u8={:>5.1}% u16={:>5.1}% u32={:>5.1}%",
+        name, min, max, fits_8, fits_16, fits_32
+    );
+}
+
+fn print_value_stats_signed(name: &str, values: &[i64]) {
+    if values.is_empty() {
+        return;
+    }
+    let min = *values.iter().min().unwrap();
+    let max = *values.iter().max().unwrap();
+    let count = values.len() as f64;
+
+    let fits_8 = values.iter().filter(|&&v| v >= i8::MIN as i64 && v <= i8::MAX as i64).count() as f64 / count * 100.0;
+    let fits_16 = values.iter().filter(|&&v| v >= i16::MIN as i64 && v <= i16::MAX as i64).count() as f64 / count * 100.0;
+    let fits_32 = values.iter().filter(|&&v| v >= i32::MIN as i64 && v <= i32::MAX as i64).count() as f64 / count * 100.0;
+
+    eprintln!(
+        "  {:<18} min={:<12} max={:<12} i8={:>5.1}% i16={:>5.1}% i32={:>5.1}%",
+        name, min, max, fits_8, fits_16, fits_32
+    );
+}
+
+fn print_column_stats(columns: &EncodedColumns, mapping_tsv_raw: usize, mapping_compressed_size: usize) {
     let num_rows = columns.event_type_indices.len();
     eprintln!("\n=== Per-Column Compressed Size Estimates ===");
     eprintln!("Total rows: {}", num_rows);
@@ -126,15 +171,16 @@ fn print_column_stats(columns: &EncodedColumns, mapping_compressed_size: usize) 
     );
 
     // mapping
+    total_raw += mapping_tsv_raw;
+    total_compressed += mapping_compressed_size;
     eprintln!(
-        "{:<20} {:>10} {:>10} {:>7}  {:>10.2}",
+        "{:<20} {:>10} {:>10} {:>7.1}% {:>10.2}",
         "repo mapping (TSV)",
-        "-",
+        mapping_tsv_raw,
         mapping_compressed_size,
-        "-",
+        100.0 * mapping_compressed_size as f64 / mapping_tsv_raw as f64,
         mapping_compressed_size as f64 / num_rows as f64
     );
-    total_compressed += mapping_compressed_size;
 
     eprintln!("{}", "-".repeat(64));
     eprintln!(
@@ -145,6 +191,13 @@ fn print_column_stats(columns: &EncodedColumns, mapping_compressed_size: usize) 
         100.0 * total_compressed as f64 / total_raw as f64,
         total_compressed as f64 / num_rows as f64
     );
+
+    // Value statistics
+    eprintln!("\n=== Value Statistics ===");
+    print_value_stats_unsigned("event_type_idx", &columns.event_type_indices.iter().map(|&v| v as u64).collect::<Vec<_>>());
+    print_value_stats_unsigned("event_id_delta", &columns.event_id_deltas.iter().map(|&v| v as u64).collect::<Vec<_>>());
+    print_value_stats_unsigned("repo_pair_idx", &columns.repo_pair_indices.iter().map(|&v| v as u64).collect::<Vec<_>>());
+    print_value_stats_signed("created_at_delta", &columns.created_at_deltas.iter().map(|&v| v as i64).collect::<Vec<_>>());
     eprintln!();
 }
 
@@ -450,7 +503,15 @@ impl EventCodec for NatebrennandCodec {
         let mapping_compressed_size = zstd::encode_all(mapping_tsv.as_slice(), ZSTD_LEVEL)?.len();
 
         if debug_enabled() {
-            print_column_stats(&columns, mapping_compressed_size);
+            eprintln!("\n=== Header ({} bytes) ===", HEADER_SIZE);
+            eprintln!("  first_event_id:       {}", header.first_event_id);
+            eprintln!("  first_timestamp:      {} ({})", header.first_timestamp, format_timestamp(header.first_timestamp));
+            eprintln!("  mapping_size:         {}", header.mapping_size);
+            eprintln!("  num_events:           {}", header.num_events);
+            eprintln!("  event_type_dict_size: {}", header.event_type_dict_size);
+            eprintln!("  num_event_types:      {}", header.num_event_types);
+
+            print_column_stats(&columns, mapping_tsv.len(), mapping_compressed_size);
         }
 
         // Build uncompressed payload:
