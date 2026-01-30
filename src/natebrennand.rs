@@ -1,4 +1,4 @@
-//! Hand-rolled columnar codec with TSV mapping table for repo info.
+//! Hand-rolled columnar codec with per-column zstd compression.
 //!
 //! Data ordering:
 //!   Events are sorted by event_id (ascending, parsed as u64) before storage.
@@ -11,32 +11,42 @@
 //!
 //! Strategy:
 //! - Dictionary encode event_type (14 unique values)
-//! - Store unique (repo_id, repo_name) pairs in a TSV mapping table (compressed once)
+//! - Store unique (repo_id, repo_name) pairs in a TSV mapping table
 //! - Per event, store only an index into the mapping table
 //! - Store first event_id in header, deltas as u8 (max delta is 251)
 //! - Store first timestamp in header, deltas as i16 (range -2540 to +2540)
 //! - Reconstruct repo.url from repo.name during decode
-//! - Use zstd level 22 compression
+//! - Compress each column separately with zstd level 22
 //!
 //! Binary format:
-//!   Header (28 bytes, uncompressed):
+//!   Header (52 bytes, uncompressed):
 //!     - first_event_id: u64
 //!     - first_timestamp: i64
-//!     - mapping_size: u32
 //!     - num_events: u32
-//!     - event_type_dict_size: u16
+//!     - mapping_size: u32 (uncompressed)
+//!     - event_type_dict_size: u16 (uncompressed)
 //!     - num_event_types: u8
 //!     - _padding: u8
+//!     - mapping_compressed: u32
+//!     - dict_compressed: u32
+//!     - packed_compressed: u32
+//!     - id_deltas_compressed: u32
+//!     - repo_compressed: u32
+//!     - ts_compressed: u32
 //!
-//!   Compressed payload (zstd-22):
-//!     - mapping TSV (repo_id\trepo_name\n)
-//!     - event_type dict (newline-separated strings)
-//!     - event_type indices: 4-bit packed [(num_events+1)/2 bytes]
-//!     - event_id deltas: [u8; num_events]
-//!     - repo_pair indices: [u32-le; num_events]
-//!     - created_at deltas: [i16-le; num_events]
+//!   Per-column compressed payloads (zstd-22, concatenated):
+//!     1. mapping TSV (repo_id\trepo_name\n)
+//!     2. event_type dict (newline-separated strings)
+//!     3. event_type indices: 4-bit packed [(num_events+1)/2 bytes]
+//!     4. event_id deltas: [u8; num_events]
+//!     5. repo_pair indices: [u32-le; num_events]
+//!     6. created_at deltas: [i16-le; num_events]
 //!
 //! Compression techniques - what worked:
+//!   - Per-column zstd compression: Compress each column separately instead of
+//!     concatenating then compressing. Each column has different statistical properties
+//!     (text vs integers, different value ranges) that benefit from independent
+//!     compression contexts. Saves ~27KB (0.4%) vs combined compression.
 //!   - Delta encoding for event_id: Sorting by event_id makes deltas small (max 251),
 //!     fitting in u8. Compresses to 0.35 B/row.
 //!   - Delta encoding for timestamps: Correlated with event_id, deltas fit in i16
@@ -87,6 +97,12 @@
 //!       Conclusion: TSV + zstd beats trie because zstd already exploits alphabetical
 //!       prefix sharing in sorted TSV entries. The trie's space-efficient structure
 //!       doesn't help when the whole thing gets zstd-compressed anyway.
+//!   - Combined column compression: Concatenating all columns then compressing as one
+//!     zstd stream gives 6,731,013 bytes vs per-column's 6,704,316 bytes. The
+//!     heterogeneous data types (text, u8, u32, i16) hurt each other when combined.
+//!   - zstd parameter tuning: Tested window_log (17-30), pledged_src_size, and checksum.
+//!     Default L22 settings (window_log=27, no checksum) are already optimal.
+//!     Smaller windows hurt significantly; pledged size adds overhead.
 //!
 //! Current results (1M events):
 //!   - event_type:       0.22 B/row (4-bit packed)
@@ -94,9 +110,10 @@
 //!   - repo_pair_idx:    2.32 B/row
 //!   - created_at_delta: 0.04 B/row
 //!   - repo mapping TSV: 3.78 B/row
-//!   - TOTAL:            6.73 B/row (6,731,041 bytes)
+//!   - Header:           52 bytes (stores compressed sizes for each column)
+//!   - TOTAL:            6.70 B/row (6,704,368 bytes)
 //!
-//! Set NATE_DEBUG=1 to see column size statistics.
+//! Set NATE_DEBUG=1 to see column size statistics and compression experiments.
 
 use bytes::Bytes;
 use chrono::DateTime;
