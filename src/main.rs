@@ -287,6 +287,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         i += 1;
     }
+
+    // Auto-enable docker mode if targeting an external codec
+    if let Some(ref filter) = codec_filter {
+        let potential_path = format!("src/{}/Dockerfile", filter);
+        if std::path::Path::new(&potential_path).exists() {
+            docker_enabled = true;
+        }
+    }
+
     let events = load_events(&path)?;
     println!("Loaded {} events from {}\n", events.len(), path);
 
