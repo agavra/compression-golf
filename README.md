@@ -24,7 +24,7 @@ This leaderboard uses the `data.json.gz` dataset included in the repo. Use this 
 
 ### Evaluation Dataset Leaderboard
 
-To prevent overfitting to the training data, a separate **evaluation dataset** will be announced on **March 1st, 2025** when the challenge ends. All submitted codecs will be run against this hidden dataset.
+To prevent overfitting to the training data, a separate **evaluation dataset** will be announced on **March 1st, 2026** when the challenge ends. All submitted codecs will be run against this hidden dataset.
 
 **Two winners will be announced:**
 1. Best compression on the **training dataset**
