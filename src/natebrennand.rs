@@ -97,6 +97,75 @@ fn print_value_stats_signed(name: &str, values: &[i64]) {
     );
 }
 
+fn print_event_type_distribution(dict: &[u8], indices: &[u8]) {
+    // Parse dictionary
+    let dict_str = std::str::from_utf8(dict).unwrap();
+    let event_types: Vec<&str> = dict_str.split('\n').collect();
+
+    // Count frequencies
+    let mut counts = vec![0usize; event_types.len()];
+    for &idx in indices {
+        counts[idx as usize] += 1;
+    }
+
+    // Sort by frequency descending
+    let mut freq: Vec<(usize, &str, usize)> = counts
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| (i, event_types[i], c))
+        .collect();
+    freq.sort_by(|a, b| b.2.cmp(&a.2));
+
+    eprintln!("\n=== Event Type Distribution ===");
+    eprintln!("{:<5} {:<25} {:>10} {:>8}", "Idx", "Type", "Count", "%");
+    eprintln!("{}", "-".repeat(52));
+    let total = indices.len() as f64;
+    for (idx, name, count) in &freq {
+        eprintln!(
+            "{:<5} {:<25} {:>10} {:>7.2}%",
+            idx, name, count, *count as f64 / total * 100.0
+        );
+    }
+
+    // Run-length analysis
+    let mut runs: Vec<usize> = Vec::new();
+    let mut current_run = 1usize;
+    for i in 1..indices.len() {
+        if indices[i] == indices[i - 1] {
+            current_run += 1;
+        } else {
+            runs.push(current_run);
+            current_run = 1;
+        }
+    }
+    runs.push(current_run);
+
+    let num_runs = runs.len();
+    let avg_run = indices.len() as f64 / num_runs as f64;
+    let max_run = *runs.iter().max().unwrap_or(&0);
+    let runs_of_1 = runs.iter().filter(|&&r| r == 1).count();
+    let runs_of_2_5 = runs.iter().filter(|&&r| r >= 2 && r <= 5).count();
+    let runs_of_6_plus = runs.iter().filter(|&&r| r >= 6).count();
+
+    eprintln!("\n=== Run-Length Analysis (event_type) ===");
+    eprintln!("  Total runs:    {:>10}", num_runs);
+    eprintln!("  Avg run len:   {:>10.2}", avg_run);
+    eprintln!("  Max run len:   {:>10}", max_run);
+    eprintln!("  Runs of 1:     {:>10} ({:.1}%)", runs_of_1, runs_of_1 as f64 / num_runs as f64 * 100.0);
+    eprintln!("  Runs of 2-5:   {:>10} ({:.1}%)", runs_of_2_5, runs_of_2_5 as f64 / num_runs as f64 * 100.0);
+    eprintln!("  Runs of 6+:    {:>10} ({:.1}%)", runs_of_6_plus, runs_of_6_plus as f64 / num_runs as f64 * 100.0);
+
+    // What would RLE cost?
+    // Each run needs: 1 byte for type index + varint for length
+    let rle_bytes: usize = runs.iter().map(|&r| {
+        1 + if r < 128 { 1 } else if r < 16384 { 2 } else { 3 }
+    }).sum();
+    eprintln!("\n  RLE estimate:  {:>10} bytes (vs {} raw)", rle_bytes, indices.len());
+    eprintln!("  RLE savings:   {:>10} bytes ({:.1}%)",
+        indices.len() as i64 - rle_bytes as i64,
+        (1.0 - rle_bytes as f64 / indices.len() as f64) * 100.0);
+}
+
 fn print_column_stats(columns: &EncodedColumns, mapping_tsv_raw: usize, mapping_compressed_size: usize) {
     let num_rows = columns.event_type_indices.len();
     eprintln!("\n=== Per-Column Compressed Size Estimates ===");
@@ -198,6 +267,9 @@ fn print_column_stats(columns: &EncodedColumns, mapping_tsv_raw: usize, mapping_
     print_value_stats_unsigned("event_id_delta", &columns.event_id_deltas.iter().map(|&v| v as u64).collect::<Vec<_>>());
     print_value_stats_unsigned("repo_pair_idx", &columns.repo_pair_indices.iter().map(|&v| v as u64).collect::<Vec<_>>());
     print_value_stats_signed("created_at_delta", &columns.created_at_deltas.iter().map(|&v| v as i64).collect::<Vec<_>>());
+
+    // Event type distribution and RLE analysis
+    print_event_type_distribution(&columns.event_type_dict, &columns.event_type_indices);
     eprintln!();
 }
 
