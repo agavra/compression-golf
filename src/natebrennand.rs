@@ -1,4 +1,4 @@
-//! Arrow IPC codec with TSV mapping table for repo info.
+//! Hand-rolled columnar codec with TSV mapping table for repo info.
 //!
 //! Strategy:
 //! - Sort by event_id for optimal delta encoding
@@ -10,21 +10,16 @@
 //! - Reconstruct repo.url from repo.name during decode
 //! - Use zstd level 22 compression
 //!
+//! Binary format:
+//! - Header (28 bytes, uncompressed)
+//! - Compressed payload: mapping TSV + event_type dict + columns
+//!
 //! Set NATE_DEBUG=1 to see column size statistics.
 
-use arrow::array::{
-    Array, ArrayRef, DictionaryArray, Int16Array, RecordBatch, StringArray, UInt32Array,
-    UInt8Array,
-};
-use arrow::datatypes::{DataType, Field, Int8Type, Schema};
-use arrow::ipc::reader::StreamReader;
-use arrow::ipc::writer::StreamWriter;
 use bytes::Bytes;
 use chrono::DateTime;
 use std::collections::HashMap;
 use std::error::Error;
-use std::io::Cursor;
-use std::sync::Arc;
 
 use crate::codec::EventCodec;
 use crate::{EventKey, EventValue, Repo};
@@ -43,8 +38,8 @@ fn debug_enabled() -> bool {
     std::env::var("NATE_DEBUG").is_ok()
 }
 
-fn print_column_stats(batch: &RecordBatch, mapping_compressed_size: usize) {
-    let num_rows = batch.num_rows();
+fn print_column_stats(columns: &EncodedColumns, mapping_compressed_size: usize) {
+    let num_rows = columns.event_type_indices.len();
     eprintln!("\n=== Per-Column Compressed Size Estimates ===");
     eprintln!("Total rows: {}", num_rows);
     eprintln!("{:<20} {:>10} {:>10} {:>8} {:>10}", "Column", "Raw", "Zstd", "Ratio", "B/Row");
@@ -53,38 +48,70 @@ fn print_column_stats(batch: &RecordBatch, mapping_compressed_size: usize) {
     let mut total_raw = 0usize;
     let mut total_compressed = 0usize;
 
-    for (i, field) in batch.schema().fields().iter().enumerate() {
-        let col = batch.column(i);
-        let raw_size = col.get_array_memory_size();
+    // event_type (dict + indices)
+    let dict_raw = columns.event_type_dict.len();
+    let indices_raw = columns.event_type_indices.len();
+    let event_type_raw = dict_raw + indices_raw;
+    let mut event_type_buf = Vec::with_capacity(event_type_raw);
+    event_type_buf.extend_from_slice(&columns.event_type_dict);
+    event_type_buf.extend_from_slice(&columns.event_type_indices);
+    let event_type_compressed = zstd::encode_all(event_type_buf.as_slice(), ZSTD_LEVEL).unwrap().len();
+    total_raw += event_type_raw;
+    total_compressed += event_type_compressed;
+    eprintln!(
+        "{:<20} {:>10} {:>10} {:>7.1}% {:>10.2}",
+        "event_type",
+        event_type_raw,
+        event_type_compressed,
+        100.0 * event_type_compressed as f64 / event_type_raw as f64,
+        event_type_compressed as f64 / num_rows as f64
+    );
 
-        let single_schema = Arc::new(Schema::new(vec![field.clone()]));
-        let single_batch = RecordBatch::try_new(
-            single_schema.clone(),
-            vec![col.clone()],
-        ).unwrap();
+    // event_id_delta
+    let eid_raw = columns.event_id_deltas.len();
+    let eid_compressed = zstd::encode_all(columns.event_id_deltas.as_slice(), ZSTD_LEVEL).unwrap().len();
+    total_raw += eid_raw;
+    total_compressed += eid_compressed;
+    eprintln!(
+        "{:<20} {:>10} {:>10} {:>7.1}% {:>10.2}",
+        "event_id_delta",
+        eid_raw,
+        eid_compressed,
+        100.0 * eid_compressed as f64 / eid_raw as f64,
+        eid_compressed as f64 / num_rows as f64
+    );
 
-        let mut buf = Vec::new();
-        {
-            let mut writer = StreamWriter::try_new(&mut buf, &single_schema).unwrap();
-            writer.write(&single_batch).unwrap();
-            writer.finish().unwrap();
-        }
-        let compressed = zstd::encode_all(buf.as_slice(), ZSTD_LEVEL).unwrap();
-        let compressed_size = compressed.len();
+    // repo_pair_idx
+    let repo_raw = columns.repo_pair_indices.len() * 4;
+    let repo_bytes: Vec<u8> = columns.repo_pair_indices.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let repo_compressed = zstd::encode_all(repo_bytes.as_slice(), ZSTD_LEVEL).unwrap().len();
+    total_raw += repo_raw;
+    total_compressed += repo_compressed;
+    eprintln!(
+        "{:<20} {:>10} {:>10} {:>7.1}% {:>10.2}",
+        "repo_pair_idx",
+        repo_raw,
+        repo_compressed,
+        100.0 * repo_compressed as f64 / repo_raw as f64,
+        repo_compressed as f64 / num_rows as f64
+    );
 
-        total_raw += raw_size;
-        total_compressed += compressed_size;
+    // created_at_delta
+    let ts_raw = columns.created_at_deltas.len() * 2;
+    let ts_bytes: Vec<u8> = columns.created_at_deltas.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let ts_compressed = zstd::encode_all(ts_bytes.as_slice(), ZSTD_LEVEL).unwrap().len();
+    total_raw += ts_raw;
+    total_compressed += ts_compressed;
+    eprintln!(
+        "{:<20} {:>10} {:>10} {:>7.1}% {:>10.2}",
+        "created_at_delta",
+        ts_raw,
+        ts_compressed,
+        100.0 * ts_compressed as f64 / ts_raw as f64,
+        ts_compressed as f64 / num_rows as f64
+    );
 
-        eprintln!(
-            "{:<20} {:>10} {:>10} {:>7.1}% {:>10.2}",
-            field.name(),
-            raw_size,
-            compressed_size,
-            100.0 * compressed_size as f64 / raw_size as f64,
-            compressed_size as f64 / num_rows as f64
-        );
-    }
-
+    // mapping
     eprintln!(
         "{:<20} {:>10} {:>10} {:>7}  {:>10.2}",
         "repo mapping (TSV)",
@@ -119,27 +146,18 @@ fn format_timestamp(ts: i64) -> String {
         .unwrap_or_default()
 }
 
-fn build_schema() -> Schema {
-    Schema::new(vec![
-        Field::new(
-            "event_type",
-            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
-            false,
-        ),
-        Field::new("event_id_delta", DataType::UInt8, false),
-        Field::new("repo_pair_idx", DataType::UInt32, false),
-        Field::new("created_at_delta", DataType::Int16, false),
-    ])
-}
-
 /// Header: first_event_id (u64) + first_timestamp (i64) + mapping_size (u32)
+///       + num_events (u32) + event_type_dict_size (u16) + num_event_types (u8) + padding (u8)
 struct Header {
     first_event_id: u64,
     first_timestamp: i64,
     mapping_size: u32,
+    num_events: u32,
+    event_type_dict_size: u16,
+    num_event_types: u8,
 }
 
-const HEADER_SIZE: usize = 20; // 8 + 8 + 4
+const HEADER_SIZE: usize = 28; // 8 + 8 + 4 + 4 + 2 + 1 + 1
 
 impl Header {
     fn encode(&self) -> [u8; HEADER_SIZE] {
@@ -147,6 +165,10 @@ impl Header {
         buf[0..8].copy_from_slice(&self.first_event_id.to_le_bytes());
         buf[8..16].copy_from_slice(&self.first_timestamp.to_le_bytes());
         buf[16..20].copy_from_slice(&self.mapping_size.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.num_events.to_le_bytes());
+        buf[24..26].copy_from_slice(&self.event_type_dict_size.to_le_bytes());
+        buf[26] = self.num_event_types;
+        // buf[27] is padding
         buf
     }
 
@@ -154,8 +176,27 @@ impl Header {
         let first_event_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
         let first_timestamp = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
         let mapping_size = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
-        Self { first_event_id, first_timestamp, mapping_size }
+        let num_events = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+        let event_type_dict_size = u16::from_le_bytes(bytes[24..26].try_into().unwrap());
+        let num_event_types = bytes[26];
+        Self {
+            first_event_id,
+            first_timestamp,
+            mapping_size,
+            num_events,
+            event_type_dict_size,
+            num_event_types,
+        }
     }
+}
+
+/// Holds the encoded column data before compression
+struct EncodedColumns {
+    event_type_dict: Vec<u8>,       // newline-separated event type strings
+    event_type_indices: Vec<u8>,    // i8 indices as bytes
+    event_id_deltas: Vec<u8>,       // u8 deltas
+    repo_pair_indices: Vec<u32>,    // u32 indices
+    created_at_deltas: Vec<i16>,    // i16 deltas
 }
 
 /// Build TSV mapping table from events, returns (tsv_bytes, pair_to_idx mapping)
@@ -247,9 +288,38 @@ fn restore_i64_from_deltas(first: i64, deltas: &[i16]) -> Vec<i64> {
     values
 }
 
-fn encode_events(events: &[(EventKey, EventValue)]) -> Result<(Header, Vec<u8>, RecordBatch), Box<dyn Error>> {
-    let schema = Arc::new(build_schema());
+/// Build dictionary encoding for event types
+fn build_event_type_dict(event_types: &[&str]) -> (Vec<u8>, Vec<u8>, HashMap<String, u8>) {
+    // Collect unique event types and sort for deterministic ordering
+    let mut unique_types: Vec<String> = event_types
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    unique_types.sort();
 
+    // Build dictionary: newline-separated strings
+    let dict_str = unique_types.join("\n");
+    let dict_bytes = dict_str.into_bytes();
+
+    // Build string -> index mapping
+    let str_to_idx: HashMap<String, u8> = unique_types
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.clone(), i as u8))
+        .collect();
+
+    // Encode each event type as its index
+    let indices: Vec<u8> = event_types
+        .iter()
+        .map(|s| str_to_idx[*s])
+        .collect();
+
+    (dict_bytes, indices, str_to_idx)
+}
+
+fn encode_events(events: &[(EventKey, EventValue)]) -> Result<(Header, Vec<u8>, EncodedColumns), Box<dyn Error>> {
     // Build mapping table first
     let (mapping_tsv, pair_to_idx) = build_mapping_table(events);
 
@@ -279,83 +349,58 @@ fn encode_events(events: &[(EventKey, EventValue)]) -> Result<(Header, Vec<u8>, 
         .map(|&i| parse_timestamp(&events[i].1.created_at))
         .collect();
 
+    // Build event type dictionary
+    let (event_type_dict, event_type_indices, _) = build_event_type_dict(&event_types);
+    let num_event_types = event_type_dict.split(|&b| b == b'\n').count() as u8;
+
+    // Delta encode
+    let event_id_deltas = compute_u8_deltas(&event_ids);
+    let created_at_deltas = compute_i16_deltas(&timestamps);
+
     // Create header
     let header = Header {
         first_event_id: event_ids[0],
         first_timestamp: timestamps[0],
         mapping_size: mapping_tsv.len() as u32,
+        num_events: events.len() as u32,
+        event_type_dict_size: event_type_dict.len() as u16,
+        num_event_types,
     };
 
-    // Delta encode
-    let event_id_deltas = compute_u8_deltas(&event_ids);
-    let timestamp_deltas = compute_i16_deltas(&timestamps);
+    let columns = EncodedColumns {
+        event_type_dict,
+        event_type_indices,
+        event_id_deltas,
+        repo_pair_indices,
+        created_at_deltas,
+    };
 
-    // Build arrays
-    let event_type_array: DictionaryArray<Int8Type> = event_types.into_iter().collect();
-    let event_id_array = UInt8Array::from(event_id_deltas);
-    let repo_pair_idx_array = UInt32Array::from(repo_pair_indices);
-    let timestamp_array = Int16Array::from(timestamp_deltas);
-
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(event_type_array) as ArrayRef,
-            Arc::new(event_id_array) as ArrayRef,
-            Arc::new(repo_pair_idx_array) as ArrayRef,
-            Arc::new(timestamp_array) as ArrayRef,
-        ],
-    )?;
-
-    Ok((header, mapping_tsv, batch))
+    Ok((header, mapping_tsv, columns))
 }
 
-fn decode_batch(header: &Header, mapping: &[(u32, String)], batch: &RecordBatch) -> Result<Vec<(EventKey, EventValue)>, Box<dyn Error>> {
-    let event_type_array = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<DictionaryArray<Int8Type>>()
-        .ok_or("Failed to downcast event_type")?;
-
-    let event_id_delta_array = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<UInt8Array>()
-        .ok_or("Failed to downcast event_id_delta")?;
-
-    let repo_pair_idx_array = batch
-        .column(2)
-        .as_any()
-        .downcast_ref::<UInt32Array>()
-        .ok_or("Failed to downcast repo_pair_idx")?;
-
-    let timestamp_delta_array = batch
-        .column(3)
-        .as_any()
-        .downcast_ref::<Int16Array>()
-        .ok_or("Failed to downcast created_at_delta")?;
-
+/// Decode events from raw column data
+fn decode_columns(
+    header: &Header,
+    mapping: &[(u32, String)],
+    event_type_dict: &[String],
+    event_type_indices: &[u8],
+    event_id_deltas: &[u8],
+    repo_pair_indices: &[u32],
+    created_at_deltas: &[i16],
+) -> Vec<(EventKey, EventValue)> {
     // Restore values from deltas
-    let event_id_deltas: Vec<u8> = event_id_delta_array.values().iter().copied().collect();
-    let timestamp_deltas: Vec<i16> = timestamp_delta_array.values().iter().copied().collect();
-    let event_ids = restore_u64_from_deltas(header.first_event_id, &event_id_deltas);
-    let timestamps = restore_i64_from_deltas(header.first_timestamp, &timestamp_deltas);
+    let event_ids = restore_u64_from_deltas(header.first_event_id, event_id_deltas);
+    let timestamps = restore_i64_from_deltas(header.first_timestamp, created_at_deltas);
 
-    // Get string values from dictionary
-    let event_type_values = event_type_array
-        .values()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or("Failed to get event_type values")?;
-
-    let events: Vec<(EventKey, EventValue)> = (0..batch.num_rows())
+    (0..header.num_events as usize)
         .map(|i| {
-            let event_type_idx = event_type_array.keys().value(i) as usize;
-            let event_type = event_type_values.value(event_type_idx).to_string();
+            let event_type_idx = event_type_indices[i] as usize;
+            let event_type = event_type_dict[event_type_idx].clone();
 
             let event_id = event_ids[i];
 
             // Look up repo info from mapping table
-            let pair_idx = repo_pair_idx_array.value(i) as usize;
+            let pair_idx = repo_pair_indices[i] as usize;
             let (repo_id, repo_name) = &mapping[pair_idx];
 
             let timestamp = timestamps[i];
@@ -376,9 +421,7 @@ fn decode_batch(header: &Header, mapping: &[(u32, String)], batch: &RecordBatch)
                 },
             )
         })
-        .collect();
-
-    Ok(events)
+        .collect()
 }
 
 impl EventCodec for NatebrennandCodec {
@@ -387,45 +430,49 @@ impl EventCodec for NatebrennandCodec {
     }
 
     fn encode(&self, events: &[(EventKey, EventValue)]) -> Result<Bytes, Box<dyn Error>> {
-        let (header, mapping_tsv, batch) = encode_events(events)?;
+        let (header, mapping_tsv, columns) = encode_events(events)?;
 
         // Compute mapping compressed size for stats
         let mapping_compressed_size = zstd::encode_all(mapping_tsv.as_slice(), ZSTD_LEVEL)?.len();
 
         if debug_enabled() {
-            print_column_stats(&batch, mapping_compressed_size);
+            print_column_stats(&columns, mapping_compressed_size);
         }
 
-        // Write Arrow IPC stream
-        let mut ipc_buf = Vec::new();
-        {
-            let mut writer = StreamWriter::try_new(&mut ipc_buf, &batch.schema())?;
-            writer.write(&batch)?;
-            writer.finish()?;
-        }
+        // Build uncompressed payload:
+        // - mapping TSV
+        // - event_type dict (newline-separated)
+        // - event_type indices
+        // - event_id deltas
+        // - repo_pair_indices (as le bytes)
+        // - created_at deltas (as le bytes)
+        let repo_bytes: Vec<u8> = columns.repo_pair_indices.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let ts_bytes: Vec<u8> = columns.created_at_deltas.iter().flat_map(|v| v.to_le_bytes()).collect();
 
-        if debug_enabled() {
-            let ipc_compressed = zstd::encode_all(ipc_buf.as_slice(), ZSTD_LEVEL)?;
-            eprintln!("Mapping TSV: {} -> {} bytes ({:.1}%)",
-                mapping_tsv.len(), mapping_compressed_size,
-                100.0 * mapping_compressed_size as f64 / mapping_tsv.len() as f64);
-            eprintln!("IPC: {} -> {} bytes ({:.1}%)",
-                ipc_buf.len(), ipc_compressed.len(),
-                100.0 * ipc_compressed.len() as f64 / ipc_buf.len() as f64);
-        }
+        let payload_size = mapping_tsv.len()
+            + columns.event_type_dict.len()
+            + columns.event_type_indices.len()
+            + columns.event_id_deltas.len()
+            + repo_bytes.len()
+            + ts_bytes.len();
 
-        // Compress mapping + IPC together
-        let mut uncompressed = Vec::with_capacity(mapping_tsv.len() + ipc_buf.len());
+        let mut uncompressed = Vec::with_capacity(payload_size);
         uncompressed.extend_from_slice(&mapping_tsv);
-        uncompressed.extend_from_slice(&ipc_buf);
+        uncompressed.extend_from_slice(&columns.event_type_dict);
+        uncompressed.extend_from_slice(&columns.event_type_indices);
+        uncompressed.extend_from_slice(&columns.event_id_deltas);
+        uncompressed.extend_from_slice(&repo_bytes);
+        uncompressed.extend_from_slice(&ts_bytes);
+
         let compressed = zstd::encode_all(uncompressed.as_slice(), ZSTD_LEVEL)?;
 
-        // Final output: header + compressed(mapping + IPC)
+        // Final output: header + compressed payload
         let mut buf = Vec::with_capacity(HEADER_SIZE + compressed.len());
         buf.extend_from_slice(&header.encode());
         buf.extend_from_slice(&compressed);
 
         if debug_enabled() {
+            eprintln!("Uncompressed payload: {} bytes", payload_size);
             eprintln!("Compressed size (zstd {}): {} bytes", ZSTD_LEVEL, buf.len());
             eprintln!("Compressed bytes/row: {:.2}", buf.len() as f64 / events.len() as f64);
         }
@@ -439,27 +486,60 @@ impl EventCodec for NatebrennandCodec {
         // Decompress
         let decompressed = zstd::decode_all(&bytes[HEADER_SIZE..])?;
 
-        // Split into mapping and IPC
-        let mapping_bytes = &decompressed[0..header.mapping_size as usize];
-        let ipc_buf = &decompressed[header.mapping_size as usize..];
+        // Parse sections from decompressed payload
+        let mut offset = 0;
 
-        // Parse mapping table
+        // 1. Mapping TSV
+        let mapping_bytes = &decompressed[offset..offset + header.mapping_size as usize];
+        offset += header.mapping_size as usize;
         let mapping = parse_mapping_table(mapping_bytes);
 
-        // Read Arrow IPC stream
-        let cursor = Cursor::new(ipc_buf);
-        let reader = StreamReader::try_new(cursor, None)?;
+        // 2. Event type dictionary
+        let dict_bytes = &decompressed[offset..offset + header.event_type_dict_size as usize];
+        offset += header.event_type_dict_size as usize;
+        let event_type_dict: Vec<String> = std::str::from_utf8(dict_bytes)?
+            .split('\n')
+            .map(|s| s.to_string())
+            .collect();
 
-        let mut all_events = Vec::new();
-        for batch_result in reader {
-            let batch = batch_result?;
-            let events = decode_batch(&header, &mapping, &batch)?;
-            all_events.extend(events);
-        }
+        // 3. Event type indices
+        let num_events = header.num_events as usize;
+        let event_type_indices = &decompressed[offset..offset + num_events];
+        offset += num_events;
+
+        // 4. Event ID deltas
+        let event_id_deltas = &decompressed[offset..offset + num_events];
+        offset += num_events;
+
+        // 5. Repo pair indices (u32 le)
+        let repo_bytes = &decompressed[offset..offset + num_events * 4];
+        offset += num_events * 4;
+        let repo_pair_indices: Vec<u32> = repo_bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+
+        // 6. Created at deltas (i16 le)
+        let ts_bytes = &decompressed[offset..offset + num_events * 2];
+        let created_at_deltas: Vec<i16> = ts_bytes
+            .chunks_exact(2)
+            .map(|chunk| i16::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+
+        // Decode events
+        let mut events = decode_columns(
+            &header,
+            &mapping,
+            &event_type_dict,
+            event_type_indices,
+            event_id_deltas,
+            &repo_pair_indices,
+            &created_at_deltas,
+        );
 
         // Sort by EventKey to match expected output
-        all_events.sort_by(|a, b| a.0.cmp(&b.0));
+        events.sort_by(|a, b| a.0.cmp(&b.0));
 
-        Ok(all_events)
+        Ok(events)
     }
 }
