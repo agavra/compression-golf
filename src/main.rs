@@ -166,6 +166,22 @@ fn discover_external_codecs() -> Vec<String> {
     codecs
 }
 
+fn build_docker_codec(name: &str) -> Result<(), Box<dyn Error>> {
+    let path = format!("src/{}", name);
+
+    let status = std::process::Command::new("docker")
+        .args(["build", "-t", name, &path])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .status()?;
+
+    if !status.success() {
+        return Err(format!("Docker build failed for {}", name).into());
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
 
