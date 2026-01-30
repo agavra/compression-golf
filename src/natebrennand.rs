@@ -36,6 +36,41 @@
 //!     - repo_pair indices: [u32-le; num_events]
 //!     - created_at deltas: [i16-le; num_events]
 //!
+//! Compression techniques - what worked:
+//!   - Delta encoding for event_id: Sorting by event_id makes deltas small (max 251),
+//!     fitting in u8. Compresses to 0.35 B/row.
+//!   - Delta encoding for timestamps: Correlated with event_id, deltas fit in i16
+//!     (99.9% fit in i8). Compresses to 0.04 B/row.
+//!   - Dictionary encoding for event_type: 15 unique values, u8 indices.
+//!     Compresses to 0.25 B/row.
+//!   - TSV mapping table: Store unique (repo_id, repo_name) pairs once, reference
+//!     by u32 index per event. TSV compresses to 3.78 B/row.
+//!   - Alphabetical TSV ordering: Enables zstd to exploit shared prefixes in
+//!     repo names (e.g., "owner/repo1", "owner/repo2").
+//!   - zstd level 22: High compression ratio, acceptable encode time for batch use.
+//!
+//! Compression techniques - what didn't work:
+//!   - RLE for event_type: Data sorted by event_id, not event_type, so runs are
+//!     short (avg 2.09, 67% length 1). RLE saves only 4.1% on raw data, and zstd
+//!     already achieves 25% ratio.
+//!   - Frequency-ordered repo indices: Reordering repos by frequency (most common
+//!     first) improved index compression by 60KB (more values fit in smaller bytes),
+//!     but hurt TSV compression by 90KB (lost alphabetical prefix sharing). Net loss.
+//!     A remapping table would cost ~1MB (262K repos * 4 bytes).
+//!   - Varint for repo_pair_idx: Would use 2.94MB vs zstd's 2.32MB on raw u32.
+//!     zstd's entropy coding already beats simple varint.
+//!   - Delta encoding for repo_pair_idx: Repos are essentially random when sorted
+//!     by event_id (99.6% runs of length 1). Deltas span full range (-262K to +262K),
+//!     only 26% fit in i16. Would use 3.47MB vs zstd's 2.32MB.
+//!
+//! Current results (1M events):
+//!   - event_type:       0.25 B/row
+//!   - event_id_delta:   0.35 B/row
+//!   - repo_pair_idx:    2.32 B/row
+//!   - created_at_delta: 0.04 B/row
+//!   - repo mapping TSV: 3.78 B/row
+//!   - TOTAL:            6.73 B/row
+//!
 //! Set NATE_DEBUG=1 to see column size statistics.
 
 use bytes::Bytes;
