@@ -122,7 +122,6 @@ use crate::{EventKey, EventValue, Repo};
 
 const ZSTD_LEVEL: i32 = 22;
 
-
 /// Pack u32 values into 24-bit (3 byte) little-endian format
 fn pack_u24(values: &[u32]) -> Vec<u8> {
     let mut result = Vec::with_capacity(values.len() * 3);
@@ -139,9 +138,7 @@ fn pack_u24(values: &[u32]) -> Vec<u8> {
 fn unpack_u24(bytes: &[u8], count: usize) -> Vec<u32> {
     let mut result = Vec::with_capacity(count);
     for chunk in bytes.chunks_exact(3).take(count) {
-        let val = chunk[0] as u32
-            | ((chunk[1] as u32) << 8)
-            | ((chunk[2] as u32) << 16);
+        let val = chunk[0] as u32 | ((chunk[1] as u32) << 8) | ((chunk[2] as u32) << 16);
         result.push(val);
     }
     result
@@ -188,7 +185,6 @@ fn decode_varint_i16(bytes: &[u8], count: usize) -> Vec<i16> {
     }
     result
 }
-
 
 pub struct NatebrennandCodec;
 
@@ -251,15 +247,15 @@ impl Header {
         let mut buf = [0u8; HEADER_SIZE];
         let mut pos = 0;
 
-        buf[pos..pos+8].copy_from_slice(&self.first_event_id.to_le_bytes());
+        buf[pos..pos + 8].copy_from_slice(&self.first_event_id.to_le_bytes());
         pos += 8;
-        buf[pos..pos+8].copy_from_slice(&self.first_timestamp.to_le_bytes());
+        buf[pos..pos + 8].copy_from_slice(&self.first_timestamp.to_le_bytes());
         pos += 8;
-        buf[pos..pos+4].copy_from_slice(&self.num_events.to_le_bytes());
+        buf[pos..pos + 4].copy_from_slice(&self.num_events.to_le_bytes());
         pos += 4;
-        buf[pos..pos+4].copy_from_slice(&self.num_mapping_entries.to_le_bytes());
+        buf[pos..pos + 4].copy_from_slice(&self.num_mapping_entries.to_le_bytes());
         pos += 4;
-        buf[pos..pos+2].copy_from_slice(&self.event_type_dict_size.to_le_bytes());
+        buf[pos..pos + 2].copy_from_slice(&self.event_type_dict_size.to_le_bytes());
         pos += 2;
         buf[pos] = self.num_event_types;
         pos += 1;
@@ -267,19 +263,19 @@ impl Header {
         pos += 1;
 
         // Compressed sizes
-        buf[pos..pos+4].copy_from_slice(&self.mapping_ids_compressed.to_le_bytes());
+        buf[pos..pos + 4].copy_from_slice(&self.mapping_ids_compressed.to_le_bytes());
         pos += 4;
-        buf[pos..pos+4].copy_from_slice(&self.mapping_names_compressed.to_le_bytes());
+        buf[pos..pos + 4].copy_from_slice(&self.mapping_names_compressed.to_le_bytes());
         pos += 4;
-        buf[pos..pos+4].copy_from_slice(&self.dict_compressed.to_le_bytes());
+        buf[pos..pos + 4].copy_from_slice(&self.dict_compressed.to_le_bytes());
         pos += 4;
-        buf[pos..pos+4].copy_from_slice(&self.packed_compressed.to_le_bytes());
+        buf[pos..pos + 4].copy_from_slice(&self.packed_compressed.to_le_bytes());
         pos += 4;
-        buf[pos..pos+4].copy_from_slice(&self.id_deltas_compressed.to_le_bytes());
+        buf[pos..pos + 4].copy_from_slice(&self.id_deltas_compressed.to_le_bytes());
         pos += 4;
-        buf[pos..pos+4].copy_from_slice(&self.repo_compressed.to_le_bytes());
+        buf[pos..pos + 4].copy_from_slice(&self.repo_compressed.to_le_bytes());
         pos += 4;
-        buf[pos..pos+4].copy_from_slice(&self.ts_compressed.to_le_bytes());
+        buf[pos..pos + 4].copy_from_slice(&self.ts_compressed.to_le_bytes());
 
         buf
     }
@@ -287,32 +283,32 @@ impl Header {
     fn decode(bytes: &[u8]) -> Self {
         let mut pos = 0;
 
-        let first_event_id = u64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap());
+        let first_event_id = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
         pos += 8;
-        let first_timestamp = i64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap());
+        let first_timestamp = i64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
         pos += 8;
-        let num_events = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        let num_events = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
         pos += 4;
-        let num_mapping_entries = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        let num_mapping_entries = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
         pos += 4;
-        let event_type_dict_size = u16::from_le_bytes(bytes[pos..pos+2].try_into().unwrap());
+        let event_type_dict_size = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
         pos += 2;
         let num_event_types = bytes[pos];
         pos += 2; // skip num_event_types + padding
 
-        let mapping_ids_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        let mapping_ids_compressed = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
         pos += 4;
-        let mapping_names_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        let mapping_names_compressed = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
         pos += 4;
-        let dict_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        let dict_compressed = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
         pos += 4;
-        let packed_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        let packed_compressed = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
         pos += 4;
-        let id_deltas_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        let id_deltas_compressed = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
         pos += 4;
-        let repo_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        let repo_compressed = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
         pos += 4;
-        let ts_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        let ts_compressed = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
 
         Self {
             first_event_id,
@@ -334,11 +330,11 @@ impl Header {
 
 /// Holds the encoded column data before compression
 struct EncodedColumns {
-    event_type_dict: Vec<u8>,       // newline-separated event type strings
-    event_type_packed: Vec<u8>,     // 4-bit packed indices (2 per byte)
-    event_id_deltas: Vec<u8>,       // u8 deltas
-    repo_pair_indices: Vec<u32>,    // u32 indices
-    created_at_deltas: Vec<i16>,    // i16 deltas
+    event_type_dict: Vec<u8>,    // newline-separated event type strings
+    event_type_packed: Vec<u8>,  // 4-bit packed indices (2 per byte)
+    event_id_deltas: Vec<u8>,    // u8 deltas
+    repo_pair_indices: Vec<u32>, // u32 indices
+    created_at_deltas: Vec<i16>, // i16 deltas
 }
 
 /// Pack 4-bit values into bytes (2 values per byte, low nibble first)
@@ -369,7 +365,9 @@ fn unpack_nibbles(packed: &[u8], count: usize) -> Vec<u8> {
 /// Build binary mapping table from events
 /// Returns (id_deltas_varint, names_bytes, pair_to_idx mapping)
 /// Repos are sorted by repo_id for optimal delta encoding of IDs.
-fn build_mapping_table(events: &[(EventKey, EventValue)]) -> (Vec<u8>, Vec<u8>, HashMap<(u32, String), u32>) {
+fn build_mapping_table(
+    events: &[(EventKey, EventValue)],
+) -> (Vec<u8>, Vec<u8>, HashMap<(u32, String), u32>) {
     // Collect unique (repo_id, repo_name) pairs
     let mut unique_pairs: Vec<(u32, String)> = events
         .iter()
@@ -415,7 +413,11 @@ fn build_mapping_table(events: &[(EventKey, EventValue)]) -> (Vec<u8>, Vec<u8>, 
 }
 
 /// Parse binary mapping table, returns Vec of (repo_id, repo_name) pairs
-fn parse_mapping_table(id_bytes: &[u8], names_bytes: &[u8], num_entries: usize) -> Vec<(u32, String)> {
+fn parse_mapping_table(
+    id_bytes: &[u8],
+    names_bytes: &[u8],
+    num_entries: usize,
+) -> Vec<(u32, String)> {
     // Decode varint delta-encoded IDs
     let mut ids = Vec::with_capacity(num_entries);
     let mut pos = 0;
@@ -520,16 +522,15 @@ fn build_event_type_dict(event_types: &[&str]) -> (Vec<u8>, Vec<u8>, HashMap<Str
         .collect();
 
     // Encode each event type as its index
-    let indices: Vec<u8> = event_types
-        .iter()
-        .map(|s| str_to_idx[*s])
-        .collect();
+    let indices: Vec<u8> = event_types.iter().map(|s| str_to_idx[*s]).collect();
 
     (dict_bytes, indices, str_to_idx)
 }
 
 /// Returns (base_info, mapping_ids, mapping_names, columns) where base_info is (first_event_id, first_timestamp, num_events, num_mapping_entries, num_event_types)
-fn encode_events(events: &[(EventKey, EventValue)]) -> Result<((u64, i64, u32, u32, u8), Vec<u8>, Vec<u8>, EncodedColumns), Box<dyn Error>> {
+fn encode_events(
+    events: &[(EventKey, EventValue)],
+) -> Result<((u64, i64, u32, u32, u8), Vec<u8>, Vec<u8>, EncodedColumns), Box<dyn Error>> {
     // Build mapping table first (binary format: ID deltas + names)
     let (mapping_ids, mapping_names, pair_to_idx) = build_mapping_table(events);
     let num_mapping_entries = pair_to_idx.len();
@@ -578,9 +579,9 @@ fn encode_events(events: &[(EventKey, EventValue)]) -> Result<((u64, i64, u32, u
 
     // Return base header info (compressed sizes filled in later)
     let base_info = (
-        event_ids[0],           // first_event_id
-        timestamps[0],          // first_timestamp
-        events.len() as u32,    // num_events
+        event_ids[0],               // first_event_id
+        timestamps[0],              // first_timestamp
+        events.len() as u32,        // num_events
         num_mapping_entries as u32, // num_mapping_entries
         num_event_types,
     );
@@ -641,11 +642,12 @@ impl EventCodec for NatebrennandCodec {
 
     fn encode(&self, events: &[(EventKey, EventValue)]) -> Result<Bytes, Box<dyn Error>> {
         let (base_info, mapping_ids, mapping_names, columns) = encode_events(events)?;
-        let (first_event_id, first_timestamp, num_events, num_mapping_entries, num_event_types) = base_info;
+        let (first_event_id, first_timestamp, num_events, num_mapping_entries, num_event_types) =
+            base_info;
 
         // Convert columns to bytes
-        let repo_bytes: Vec<u8> = pack_u24(&columns.repo_pair_indices);  // 24-bit packing
-        let ts_bytes: Vec<u8> = encode_varint_i16(&columns.created_at_deltas);  // varint encoding
+        let repo_bytes: Vec<u8> = pack_u24(&columns.repo_pair_indices); // 24-bit packing
+        let ts_bytes: Vec<u8> = encode_varint_i16(&columns.created_at_deltas); // varint encoding
 
         if debug_enabled() {
             experiment_timestamp_encoding(&columns.created_at_deltas);
@@ -657,7 +659,8 @@ impl EventCodec for NatebrennandCodec {
         let mapping_names_compressed = zstd::encode_all(mapping_names.as_slice(), ZSTD_LEVEL)?;
         let dict_compressed = zstd::encode_all(columns.event_type_dict.as_slice(), ZSTD_LEVEL)?;
         let packed_compressed = zstd::encode_all(columns.event_type_packed.as_slice(), ZSTD_LEVEL)?;
-        let id_deltas_compressed = zstd::encode_all(columns.event_id_deltas.as_slice(), ZSTD_LEVEL)?;
+        let id_deltas_compressed =
+            zstd::encode_all(columns.event_id_deltas.as_slice(), ZSTD_LEVEL)?;
         let repo_compressed = zstd::encode_all(repo_bytes.as_slice(), ZSTD_LEVEL)?;
         let ts_compressed = zstd::encode_all(ts_bytes.as_slice(), ZSTD_LEVEL)?;
 
@@ -681,13 +684,23 @@ impl EventCodec for NatebrennandCodec {
         if debug_enabled() {
             eprintln!("\n=== Header ({HEADER_SIZE} bytes) ===");
             eprintln!("  first_event_id:       {}", header.first_event_id);
-            eprintln!("  first_timestamp:      {} ({})", header.first_timestamp, format_timestamp(header.first_timestamp));
+            eprintln!(
+                "  first_timestamp:      {} ({})",
+                header.first_timestamp,
+                format_timestamp(header.first_timestamp)
+            );
             eprintln!("  num_mapping_entries:  {}", header.num_mapping_entries);
             eprintln!("  num_events:           {}", header.num_events);
             eprintln!("  event_type_dict_size: {}", header.event_type_dict_size);
             eprintln!("  num_event_types:      {}", header.num_event_types);
-            eprintln!("  mapping_ids_compressed:   {}", header.mapping_ids_compressed);
-            eprintln!("  mapping_names_compressed: {}", header.mapping_names_compressed);
+            eprintln!(
+                "  mapping_ids_compressed:   {}",
+                header.mapping_ids_compressed
+            );
+            eprintln!(
+                "  mapping_names_compressed: {}",
+                header.mapping_names_compressed
+            );
         }
 
         // Final output: header + compressed columns (concatenated)
@@ -718,8 +731,15 @@ impl EventCodec for NatebrennandCodec {
                 + repo_bytes.len()
                 + ts_bytes.len();
             eprintln!("Uncompressed payload: {payload_size} bytes");
-            eprintln!("Compressed size (per-column zstd {}): {} bytes", ZSTD_LEVEL, buf.len());
-            eprintln!("Compressed bytes/row: {:.2}", buf.len() as f64 / events.len() as f64);
+            eprintln!(
+                "Compressed size (per-column zstd {}): {} bytes",
+                ZSTD_LEVEL,
+                buf.len()
+            );
+            eprintln!(
+                "Compressed bytes/row: {:.2}",
+                buf.len() as f64 / events.len() as f64
+            );
         }
 
         Ok(Bytes::from(buf))
@@ -732,12 +752,14 @@ impl EventCodec for NatebrennandCodec {
         let mut offset = HEADER_SIZE;
 
         // 1. Mapping IDs (varint delta-encoded)
-        let mapping_ids_compressed = &bytes[offset..offset + header.mapping_ids_compressed as usize];
+        let mapping_ids_compressed =
+            &bytes[offset..offset + header.mapping_ids_compressed as usize];
         offset += header.mapping_ids_compressed as usize;
         let mapping_ids_bytes = zstd::decode_all(mapping_ids_compressed)?;
 
         // 2. Mapping names (newline-separated)
-        let mapping_names_compressed = &bytes[offset..offset + header.mapping_names_compressed as usize];
+        let mapping_names_compressed =
+            &bytes[offset..offset + header.mapping_names_compressed as usize];
         offset += header.mapping_names_compressed as usize;
         let mapping_names_bytes = zstd::decode_all(mapping_names_compressed)?;
 
@@ -803,12 +825,20 @@ impl EventCodec for NatebrennandCodec {
 // ============================================================================
 
 /// Compress with custom zstd parameters
-fn compress_with_params(data: &[u8], level: i32, window_log: Option<u32>, pledged_size: bool, checksum: bool) -> Vec<u8> {
+fn compress_with_params(
+    data: &[u8],
+    level: i32,
+    window_log: Option<u32>,
+    pledged_size: bool,
+    checksum: bool,
+) -> Vec<u8> {
     use std::io::Write;
     let mut encoder = zstd::Encoder::new(Vec::new(), level).unwrap();
 
     if let Some(wl) = window_log {
-        encoder.set_parameter(zstd::zstd_safe::CParameter::WindowLog(wl)).ok();
+        encoder
+            .set_parameter(zstd::zstd_safe::CParameter::WindowLog(wl))
+            .ok();
     }
     if pledged_size {
         encoder.set_pledged_src_size(Some(data.len() as u64)).ok();
@@ -863,7 +893,10 @@ fn experiment_mapping_formats(mapping_tsv: &[u8]) {
     }
 
     let current_compressed = zstd::encode_all(mapping_tsv, ZSTD_LEVEL).unwrap().len();
-    eprintln!("Current TSV (alpha sorted): {} bytes compressed", current_compressed);
+    eprintln!(
+        "Current TSV (alpha sorted): {} bytes compressed",
+        current_compressed
+    );
 
     // Option 1: Sort by repo_id, delta encode IDs
     let mut by_id = entries.clone();
@@ -876,9 +909,14 @@ fn experiment_mapping_formats(mapping_tsv: &[u8]) {
         delta_tsv.push_str(&format!("{}\t{}\n", delta, name));
         prev_id = *id;
     }
-    let delta_compressed = zstd::encode_all(delta_tsv.as_bytes(), ZSTD_LEVEL).unwrap().len();
-    eprintln!("ID-sorted + delta TSV:      {} bytes ({:+})",
-        delta_compressed, delta_compressed as i64 - current_compressed as i64);
+    let delta_compressed = zstd::encode_all(delta_tsv.as_bytes(), ZSTD_LEVEL)
+        .unwrap()
+        .len();
+    eprintln!(
+        "ID-sorted + delta TSV:      {} bytes ({:+})",
+        delta_compressed,
+        delta_compressed as i64 - current_compressed as i64
+    );
 
     // Option 2: Binary format - separate columns for IDs and names
     // IDs as delta-encoded varints, names as newline-separated
@@ -906,43 +944,87 @@ fn experiment_mapping_formats(mapping_tsv: &[u8]) {
     let names: Vec<&str> = by_id.iter().map(|(_, n)| *n).collect();
     let names_bytes = names.join("\n").into_bytes();
 
-    let id_compressed = zstd::encode_all(id_bytes.as_slice(), ZSTD_LEVEL).unwrap().len();
-    let names_compressed = zstd::encode_all(names_bytes.as_slice(), ZSTD_LEVEL).unwrap().len();
+    let id_compressed = zstd::encode_all(id_bytes.as_slice(), ZSTD_LEVEL)
+        .unwrap()
+        .len();
+    let names_compressed = zstd::encode_all(names_bytes.as_slice(), ZSTD_LEVEL)
+        .unwrap()
+        .len();
     let binary_total = id_compressed + names_compressed;
 
     eprintln!("Binary (ID-sorted):");
-    eprintln!("  ID deltas (varint):       {} -> {} compressed", id_bytes.len(), id_compressed);
-    eprintln!("  Names:                    {} -> {} compressed", names_bytes.len(), names_compressed);
-    eprintln!("  Total:                    {} bytes ({:+})",
-        binary_total, binary_total as i64 - current_compressed as i64);
+    eprintln!(
+        "  ID deltas (varint):       {} -> {} compressed",
+        id_bytes.len(),
+        id_compressed
+    );
+    eprintln!(
+        "  Names:                    {} -> {} compressed",
+        names_bytes.len(),
+        names_compressed
+    );
+    eprintln!(
+        "  Total:                    {} bytes ({:+})",
+        binary_total,
+        binary_total as i64 - current_compressed as i64
+    );
 
     // Option 3: Keep alpha sort, but binary format (separate ID column)
     let names_alpha: Vec<&str> = entries.iter().map(|(_, n)| *n).collect();
     let names_alpha_bytes = names_alpha.join("\n").into_bytes();
-    let ids_alpha: Vec<u8> = entries.iter().flat_map(|(id, _)| id.to_le_bytes()[..3].to_vec()).collect();
+    let ids_alpha: Vec<u8> = entries
+        .iter()
+        .flat_map(|(id, _)| id.to_le_bytes()[..3].to_vec())
+        .collect();
 
-    let names_alpha_compressed = zstd::encode_all(names_alpha_bytes.as_slice(), ZSTD_LEVEL).unwrap().len();
-    let ids_alpha_compressed = zstd::encode_all(ids_alpha.as_slice(), ZSTD_LEVEL).unwrap().len();
+    let names_alpha_compressed = zstd::encode_all(names_alpha_bytes.as_slice(), ZSTD_LEVEL)
+        .unwrap()
+        .len();
+    let ids_alpha_compressed = zstd::encode_all(ids_alpha.as_slice(), ZSTD_LEVEL)
+        .unwrap()
+        .len();
     let binary_alpha_total = names_alpha_compressed + ids_alpha_compressed;
 
     eprintln!("Binary (alpha-sorted):");
-    eprintln!("  IDs (24-bit):             {} -> {} compressed", ids_alpha.len(), ids_alpha_compressed);
-    eprintln!("  Names:                    {} -> {} compressed", names_alpha_bytes.len(), names_alpha_compressed);
-    eprintln!("  Total:                    {} bytes ({:+})",
-        binary_alpha_total, binary_alpha_total as i64 - current_compressed as i64);
+    eprintln!(
+        "  IDs (24-bit):             {} -> {} compressed",
+        ids_alpha.len(),
+        ids_alpha_compressed
+    );
+    eprintln!(
+        "  Names:                    {} -> {} compressed",
+        names_alpha_bytes.len(),
+        names_alpha_compressed
+    );
+    eprintln!(
+        "  Total:                    {} bytes ({:+})",
+        binary_alpha_total,
+        binary_alpha_total as i64 - current_compressed as i64
+    );
 }
 
 /// Experiment with variable-width timestamp deltas
 fn experiment_timestamp_encoding(deltas: &[i16]) {
     eprintln!("\n=== Timestamp Delta Encoding Experiment ===");
 
-    let fits_i8 = deltas.iter().filter(|&&d| d >= i8::MIN as i16 && d <= i8::MAX as i16).count();
-    eprintln!("Deltas fitting in i8: {} ({:.2}%)", fits_i8, fits_i8 as f64 / deltas.len() as f64 * 100.0);
+    let fits_i8 = deltas
+        .iter()
+        .filter(|&&d| d >= i8::MIN as i16 && d <= i8::MAX as i16)
+        .count();
+    eprintln!(
+        "Deltas fitting in i8: {} ({:.2}%)",
+        fits_i8,
+        fits_i8 as f64 / deltas.len() as f64 * 100.0
+    );
 
     // Current: i16 (2 bytes each)
     let i16_bytes: Vec<u8> = deltas.iter().flat_map(|v| v.to_le_bytes()).collect();
     let i16_compressed = zstd::encode_all(i16_bytes.as_slice(), ZSTD_LEVEL).unwrap();
-    eprintln!("Current (i16):       {} raw -> {} compressed", i16_bytes.len(), i16_compressed.len());
+    eprintln!(
+        "Current (i16):       {} raw -> {} compressed",
+        i16_bytes.len(),
+        i16_compressed.len()
+    );
 
     // Option 1: Pack i8 values with exception list for larger values
     // Format: [i8 values where value fits, else i8::MIN as sentinel] + [exception list]
@@ -956,7 +1038,8 @@ fn experiment_timestamp_encoding(deltas: &[i16]) {
             exceptions.push((i as u32, d));
         }
     }
-    let exception_bytes: Vec<u8> = exceptions.iter()
+    let exception_bytes: Vec<u8> = exceptions
+        .iter()
         .flat_map(|(idx, val)| {
             let mut v = Vec::with_capacity(6);
             v.extend_from_slice(&idx.to_le_bytes()[..3]); // 24-bit index
@@ -970,11 +1053,22 @@ fn experiment_timestamp_encoding(deltas: &[i16]) {
     let option1_total = packed_compressed.len() + exceptions_compressed.len();
 
     eprintln!("Option 1 (i8 + exceptions):");
-    eprintln!("  i8 values:         {} -> {} compressed", packed_i8.len(), packed_compressed.len());
-    eprintln!("  Exceptions ({}):  {} -> {} compressed",
-        exceptions.len(), exception_bytes.len(), exceptions_compressed.len());
-    eprintln!("  Total:             {} ({:+} vs i16)",
-        option1_total, option1_total as i64 - i16_compressed.len() as i64);
+    eprintln!(
+        "  i8 values:         {} -> {} compressed",
+        packed_i8.len(),
+        packed_compressed.len()
+    );
+    eprintln!(
+        "  Exceptions ({}):  {} -> {} compressed",
+        exceptions.len(),
+        exception_bytes.len(),
+        exceptions_compressed.len()
+    );
+    eprintln!(
+        "  Total:             {} ({:+} vs i16)",
+        option1_total,
+        option1_total as i64 - i16_compressed.len() as i64
+    );
 
     // Option 2: Varint encoding
     let mut varint_bytes: Vec<u8> = Vec::new();
@@ -992,9 +1086,12 @@ fn experiment_timestamp_encoding(deltas: &[i16]) {
         }
     }
     let varint_compressed = zstd::encode_all(varint_bytes.as_slice(), ZSTD_LEVEL).unwrap();
-    eprintln!("Option 2 (varint):   {} raw -> {} compressed ({:+} vs i16)",
-        varint_bytes.len(), varint_compressed.len(),
-        varint_compressed.len() as i64 - i16_compressed.len() as i64);
+    eprintln!(
+        "Option 2 (varint):   {} raw -> {} compressed ({:+} vs i16)",
+        varint_bytes.len(),
+        varint_compressed.len(),
+        varint_compressed.len() as i64 - i16_compressed.len() as i64
+    );
 }
 
 /// Experiment with bit-packing repo indices
@@ -1002,32 +1099,50 @@ fn experiment_repo_bit_packing(repo_indices: &[u32]) {
     eprintln!("\n=== Repo Index Bit-Packing Experiment ===");
 
     let max_val = *repo_indices.iter().max().unwrap_or(&0);
-    let bits_needed = if max_val > 0 { 32 - max_val.leading_zeros() } else { 1 };
+    let bits_needed = if max_val > 0 {
+        32 - max_val.leading_zeros()
+    } else {
+        1
+    };
     eprintln!("Max value: {}, bits needed: {}", max_val, bits_needed);
 
     // Current: u32 (32 bits)
     let u32_bytes: Vec<u8> = repo_indices.iter().flat_map(|v| v.to_le_bytes()).collect();
     let u32_compressed = zstd::encode_all(u32_bytes.as_slice(), ZSTD_LEVEL).unwrap();
-    eprintln!("Current (u32):     {} raw -> {} compressed", u32_bytes.len(), u32_compressed.len());
+    eprintln!(
+        "Current (u32):     {} raw -> {} compressed",
+        u32_bytes.len(),
+        u32_compressed.len()
+    );
 
     // Try different bit widths
     for bits in [18, 19, 20, 24] {
         if bits >= bits_needed {
             let packed = pack_bits(repo_indices, bits);
             let compressed = zstd::encode_all(packed.as_slice(), ZSTD_LEVEL).unwrap();
-            eprintln!("{}-bit packed:     {} raw -> {} compressed ({:+} vs u32)",
-                bits, packed.len(), compressed.len(),
-                compressed.len() as i64 - u32_compressed.len() as i64);
+            eprintln!(
+                "{}-bit packed:     {} raw -> {} compressed ({:+} vs u32)",
+                bits,
+                packed.len(),
+                compressed.len(),
+                compressed.len() as i64 - u32_compressed.len() as i64
+            );
         }
     }
 
     // Also try u16 if values fit (they don't, but for comparison)
     if max_val <= u16::MAX as u32 {
-        let u16_bytes: Vec<u8> = repo_indices.iter().flat_map(|v| (*v as u16).to_le_bytes()).collect();
+        let u16_bytes: Vec<u8> = repo_indices
+            .iter()
+            .flat_map(|v| (*v as u16).to_le_bytes())
+            .collect();
         let u16_compressed = zstd::encode_all(u16_bytes.as_slice(), ZSTD_LEVEL).unwrap();
-        eprintln!("u16:               {} raw -> {} compressed ({:+} vs u32)",
-            u16_bytes.len(), u16_compressed.len(),
-            u16_compressed.len() as i64 - u32_compressed.len() as i64);
+        eprintln!(
+            "u16:               {} raw -> {} compressed ({:+} vs u32)",
+            u16_bytes.len(),
+            u16_compressed.len(),
+            u16_compressed.len() as i64 - u32_compressed.len() as i64
+        );
     }
 }
 
@@ -1056,7 +1171,8 @@ fn experiment_compression_strategies(
     eprintln!("Total raw: {} bytes", total_raw);
 
     // Baseline: per-column with default settings
-    let baseline: usize = columns.iter()
+    let baseline: usize = columns
+        .iter()
         .map(|(_, d)| zstd::encode_all(*d, ZSTD_LEVEL).unwrap().len())
         .sum();
     eprintln!("\nBaseline (per-column L22): {:>10} bytes", baseline);
@@ -1064,37 +1180,55 @@ fn experiment_compression_strategies(
     // Strategy 1: Window log experiments (per-column)
     eprintln!("\n1. Window log experiments (per-column):");
     for window_log in [17, 20, 23, 25, 27, 30] {
-        let total: usize = columns.iter()
+        let total: usize = columns
+            .iter()
             .map(|(_, d)| compress_with_params(d, ZSTD_LEVEL, Some(window_log), false, false).len())
             .sum();
-        eprintln!("   window_log={:<2}:          {:>10} bytes ({:+} vs baseline)",
-            window_log, total, total as i64 - baseline as i64);
+        eprintln!(
+            "   window_log={:<2}:          {:>10} bytes ({:+} vs baseline)",
+            window_log,
+            total,
+            total as i64 - baseline as i64
+        );
     }
 
     // Strategy 2: Pledged source size
     eprintln!("\n2. Pledged source size (per-column):");
-    let with_pledged: usize = columns.iter()
+    let with_pledged: usize = columns
+        .iter()
         .map(|(_, d)| compress_with_params(d, ZSTD_LEVEL, None, true, false).len())
         .sum();
-    eprintln!("   with pledged size:      {:>10} bytes ({:+} vs baseline)",
-        with_pledged, with_pledged as i64 - baseline as i64);
+    eprintln!(
+        "   with pledged size:      {:>10} bytes ({:+} vs baseline)",
+        with_pledged,
+        with_pledged as i64 - baseline as i64
+    );
 
     // Strategy 3: Checksum (should add overhead)
     eprintln!("\n3. Checksum overhead:");
-    let with_checksum: usize = columns.iter()
+    let with_checksum: usize = columns
+        .iter()
         .map(|(_, d)| compress_with_params(d, ZSTD_LEVEL, None, false, true).len())
         .sum();
-    eprintln!("   with checksum:          {:>10} bytes ({:+} vs baseline)",
-        with_checksum, with_checksum as i64 - baseline as i64);
+    eprintln!(
+        "   with checksum:          {:>10} bytes ({:+} vs baseline)",
+        with_checksum,
+        with_checksum as i64 - baseline as i64
+    );
 
     // Strategy 4: Combined optimizations
     eprintln!("\n4. Combined parameter tuning:");
     for window_log in [23, 25, 27] {
-        let total: usize = columns.iter()
+        let total: usize = columns
+            .iter()
             .map(|(_, d)| compress_with_params(d, ZSTD_LEVEL, Some(window_log), true, false).len())
             .sum();
-        eprintln!("   wlog={} + pledged:      {:>10} bytes ({:+} vs baseline)",
-            window_log, total, total as i64 - baseline as i64);
+        eprintln!(
+            "   wlog={} + pledged:      {:>10} bytes ({:+} vs baseline)",
+            window_log,
+            total,
+            total as i64 - baseline as i64
+        );
     }
 
     // Strategy 5: Per-column optimal window_log
@@ -1111,12 +1245,20 @@ fn experiment_compression_strategies(
             }
         }
         let default_size = zstd::encode_all(*data, ZSTD_LEVEL).unwrap().len();
-        eprintln!("   {:<20} best wlog={:<2}: {:>8} bytes ({:+} vs default)",
-            name, best_wlog, best_size, best_size as i64 - default_size as i64);
+        eprintln!(
+            "   {:<20} best wlog={:<2}: {:>8} bytes ({:+} vs default)",
+            name,
+            best_wlog,
+            best_size,
+            best_size as i64 - default_size as i64
+        );
         optimized_total += best_size;
     }
-    eprintln!("   Optimized total:        {:>10} bytes ({:+} vs baseline)",
-        optimized_total, optimized_total as i64 - baseline as i64);
+    eprintln!(
+        "   Optimized total:        {:>10} bytes ({:+} vs baseline)",
+        optimized_total,
+        optimized_total as i64 - baseline as i64
+    );
 
     // Strategy 6: Higher compression levels with larger window
     eprintln!("\n6. High compression with large window (single combined):");
@@ -1127,13 +1269,19 @@ fn experiment_compression_strategies(
     for level in [19, 22] {
         for wlog in [25, 27, 30] {
             let size = compress_with_params(&combined, level, Some(wlog), true, false).len();
-            let baseline_combined = zstd::encode_all(combined.as_slice(), ZSTD_LEVEL).unwrap().len();
-            eprintln!("   L{} wlog={}:             {:>10} bytes ({:+} vs L22 default)",
-                level, wlog, size, size as i64 - baseline_combined as i64);
+            let baseline_combined = zstd::encode_all(combined.as_slice(), ZSTD_LEVEL)
+                .unwrap()
+                .len();
+            eprintln!(
+                "   L{} wlog={}:             {:>10} bytes ({:+} vs L22 default)",
+                level,
+                wlog,
+                size,
+                size as i64 - baseline_combined as i64
+            );
         }
     }
 }
-
 
 fn debug_enabled() -> bool {
     std::env::var("NATE_DEBUG").is_ok()
@@ -1165,9 +1313,24 @@ fn print_value_stats_signed(name: &str, values: &[i64]) {
     let max = *values.iter().max().unwrap();
     let count = values.len() as f64;
 
-    let fits_8 = values.iter().filter(|&&v| v >= i8::MIN as i64 && v <= i8::MAX as i64).count() as f64 / count * 100.0;
-    let fits_16 = values.iter().filter(|&&v| v >= i16::MIN as i64 && v <= i16::MAX as i64).count() as f64 / count * 100.0;
-    let fits_32 = values.iter().filter(|&&v| v >= i32::MIN as i64 && v <= i32::MAX as i64).count() as f64 / count * 100.0;
+    let fits_8 = values
+        .iter()
+        .filter(|&&v| v >= i8::MIN as i64 && v <= i8::MAX as i64)
+        .count() as f64
+        / count
+        * 100.0;
+    let fits_16 = values
+        .iter()
+        .filter(|&&v| v >= i16::MIN as i64 && v <= i16::MAX as i64)
+        .count() as f64
+        / count
+        * 100.0;
+    let fits_32 = values
+        .iter()
+        .filter(|&&v| v >= i32::MIN as i64 && v <= i32::MAX as i64)
+        .count() as f64
+        / count
+        * 100.0;
 
     eprintln!(
         "  {name:<18} min={min:<12} max={max:<12} i8={fits_8:>5.1}% i16={fits_16:>5.1}% i32={fits_32:>5.1}%"
@@ -1200,7 +1363,10 @@ fn print_event_type_distribution(dict: &[u8], indices: &[u8]) {
     for (idx, name, count) in &freq {
         eprintln!(
             "{:<5} {:<25} {:>10} {:>7.2}%",
-            idx, name, count, *count as f64 / total * 100.0
+            idx,
+            name,
+            count,
+            *count as f64 / total * 100.0
         );
     }
 
@@ -1228,22 +1394,50 @@ fn print_event_type_distribution(dict: &[u8], indices: &[u8]) {
     eprintln!("  Total runs:    {num_runs:>10}");
     eprintln!("  Avg run len:   {avg_run:>10.2}");
     eprintln!("  Max run len:   {max_run:>10}");
-    eprintln!("  Runs of 1:     {:>10} ({:.1}%)", runs_of_1, runs_of_1 as f64 / num_runs as f64 * 100.0);
-    eprintln!("  Runs of 2-5:   {:>10} ({:.1}%)", runs_of_2_5, runs_of_2_5 as f64 / num_runs as f64 * 100.0);
-    eprintln!("  Runs of 6+:    {:>10} ({:.1}%)", runs_of_6_plus, runs_of_6_plus as f64 / num_runs as f64 * 100.0);
+    eprintln!(
+        "  Runs of 1:     {:>10} ({:.1}%)",
+        runs_of_1,
+        runs_of_1 as f64 / num_runs as f64 * 100.0
+    );
+    eprintln!(
+        "  Runs of 2-5:   {:>10} ({:.1}%)",
+        runs_of_2_5,
+        runs_of_2_5 as f64 / num_runs as f64 * 100.0
+    );
+    eprintln!(
+        "  Runs of 6+:    {:>10} ({:.1}%)",
+        runs_of_6_plus,
+        runs_of_6_plus as f64 / num_runs as f64 * 100.0
+    );
 
     // What would RLE cost?
     // Each run needs: 1 byte for type index + varint for length
-    let rle_bytes: usize = runs.iter().map(|&r| {
-        1 + if r < 128 { 1 } else if r < 16384 { 2 } else { 3 }
-    }).sum();
-    eprintln!("\n  RLE estimate:  {:>10} bytes (vs {} raw)", rle_bytes, indices.len());
-    eprintln!("  RLE savings:   {:>10} bytes ({:.1}%)",
+    let rle_bytes: usize = runs
+        .iter()
+        .map(|&r| {
+            1 + if r < 128 {
+                1
+            } else if r < 16384 {
+                2
+            } else {
+                3
+            }
+        })
+        .sum();
+    eprintln!(
+        "\n  RLE estimate:  {:>10} bytes (vs {} raw)",
+        rle_bytes,
+        indices.len()
+    );
+    eprintln!(
+        "  RLE savings:   {:>10} bytes ({:.1}%)",
         indices.len() as i64 - rle_bytes as i64,
-        (1.0 - rle_bytes as f64 / indices.len() as f64) * 100.0);
+        (1.0 - rle_bytes as f64 / indices.len() as f64) * 100.0
+    );
 
     // Entropy analysis (theoretical minimum bits)
-    let entropy: f64 = freq.iter()
+    let entropy: f64 = freq
+        .iter()
         .filter(|(_, _, c)| *c > 0)
         .map(|(_, _, c)| {
             let p = *c as f64 / total;
@@ -1258,17 +1452,36 @@ fn print_event_type_distribution(dict: &[u8], indices: &[u8]) {
     for (_, _, count) in freq.iter() {
         // Approximate bit length: ceil(log2(total/count)) but min 1
         let p = *count as f64 / total;
-        let bits = if p >= 0.5 { 1.0 } else { (-p.log2()).ceil().min(8.0) };
+        let bits = if p >= 0.5 {
+            1.0
+        } else {
+            (-p.log2()).ceil().min(8.0)
+        };
         huffman_bits += *count as f64 * bits;
     }
     let huffman_bytes = huffman_bits / 8.0;
 
     eprintln!("\n=== Entropy Analysis (event_type) ===");
     eprintln!("  Shannon entropy: {entropy:.3} bits/symbol");
-    eprintln!("  Theoretical min: {:>10.0} bytes ({:.2} B/row)", entropy_bytes, entropy_bytes / total);
-    eprintln!("  Huffman estimate:{:>10.0} bytes ({:.2} B/row)", huffman_bytes, huffman_bytes / total);
-    eprintln!("  4-bit packing:   {:>10} bytes ({:.2} B/row)", (indices.len() + 1) / 2, 0.5);
-    eprintln!("  Current (zstd):  {:>10} bytes ({:.2} B/row)", 223132, 0.22);  // from debug output
+    eprintln!(
+        "  Theoretical min: {:>10.0} bytes ({:.2} B/row)",
+        entropy_bytes,
+        entropy_bytes / total
+    );
+    eprintln!(
+        "  Huffman estimate:{:>10.0} bytes ({:.2} B/row)",
+        huffman_bytes,
+        huffman_bytes / total
+    );
+    eprintln!(
+        "  4-bit packing:   {:>10} bytes ({:.2} B/row)",
+        (indices.len() + 1) / 2,
+        0.5
+    );
+    eprintln!(
+        "  Current (zstd):  {:>10} bytes ({:.2} B/row)",
+        223132, 0.22
+    ); // from debug output
 }
 
 fn print_repo_pair_idx_analysis(indices: &[u32]) {
@@ -1290,14 +1503,26 @@ fn print_repo_pair_idx_analysis(indices: &[u32]) {
     freq.sort_by(|a, b| b.1.cmp(&a.1));
 
     eprintln!("\n=== Repo Pair Index Distribution ===");
-    eprintln!("  Unique repos used: {} (of {} in mapping)", unique_repos, indices.iter().max().unwrap_or(&0) + 1);
-    eprintln!("  Events per repo:   {:.2} avg", total_f / unique_repos as f64);
+    eprintln!(
+        "  Unique repos used: {} (of {} in mapping)",
+        unique_repos,
+        indices.iter().max().unwrap_or(&0) + 1
+    );
+    eprintln!(
+        "  Events per repo:   {:.2} avg",
+        total_f / unique_repos as f64
+    );
 
     // Top 10 repos
     eprintln!("\n  Top 10 repos by event count:");
     for (i, (idx, count)) in freq.iter().take(10).enumerate() {
-        eprintln!("    {:>2}. idx={:<8} count={:<8} ({:.2}%)",
-            i + 1, idx, count, *count as f64 / total_f * 100.0);
+        eprintln!(
+            "    {:>2}. idx={:<8} count={:<8} ({:.2}%)",
+            i + 1,
+            idx,
+            count,
+            *count as f64 / total_f * 100.0
+        );
     }
 
     // Frequency buckets
@@ -1307,10 +1532,26 @@ fn print_repo_pair_idx_analysis(indices: &[u32]) {
     let repos_101_plus = freq.iter().filter(|(_, c)| *c > 100).count();
 
     eprintln!("\n  Repos by event count:");
-    eprintln!("    1 event:     {:>8} repos ({:.1}%)", repos_1_event, repos_1_event as f64 / unique_repos as f64 * 100.0);
-    eprintln!("    2-10:        {:>8} repos ({:.1}%)", repos_2_10, repos_2_10 as f64 / unique_repos as f64 * 100.0);
-    eprintln!("    11-100:      {:>8} repos ({:.1}%)", repos_11_100, repos_11_100 as f64 / unique_repos as f64 * 100.0);
-    eprintln!("    101+:        {:>8} repos ({:.1}%)", repos_101_plus, repos_101_plus as f64 / unique_repos as f64 * 100.0);
+    eprintln!(
+        "    1 event:     {:>8} repos ({:.1}%)",
+        repos_1_event,
+        repos_1_event as f64 / unique_repos as f64 * 100.0
+    );
+    eprintln!(
+        "    2-10:        {:>8} repos ({:.1}%)",
+        repos_2_10,
+        repos_2_10 as f64 / unique_repos as f64 * 100.0
+    );
+    eprintln!(
+        "    11-100:      {:>8} repos ({:.1}%)",
+        repos_11_100,
+        repos_11_100 as f64 / unique_repos as f64 * 100.0
+    );
+    eprintln!(
+        "    101+:        {:>8} repos ({:.1}%)",
+        repos_101_plus,
+        repos_101_plus as f64 / unique_repos as f64 * 100.0
+    );
 
     // Run-length analysis
     let mut runs: Vec<usize> = Vec::new();
@@ -1334,10 +1575,15 @@ fn print_repo_pair_idx_analysis(indices: &[u32]) {
     eprintln!("  Total runs:    {num_runs:>10}");
     eprintln!("  Avg run len:   {avg_run:>10.2}");
     eprintln!("  Max run len:   {max_run:>10}");
-    eprintln!("  Runs of 1:     {:>10} ({:.1}%)", runs_of_1, runs_of_1 as f64 / num_runs as f64 * 100.0);
+    eprintln!(
+        "  Runs of 1:     {:>10} ({:.1}%)",
+        runs_of_1,
+        runs_of_1 as f64 / num_runs as f64 * 100.0
+    );
 
     // Delta analysis (consecutive differences)
-    let deltas: Vec<i64> = indices.windows(2)
+    let deltas: Vec<i64> = indices
+        .windows(2)
         .map(|w| w[1] as i64 - w[0] as i64)
         .collect();
 
@@ -1345,39 +1591,87 @@ fn print_repo_pair_idx_analysis(indices: &[u32]) {
         let delta_min = *deltas.iter().min().unwrap();
         let delta_max = *deltas.iter().max().unwrap();
         let zeros = deltas.iter().filter(|&&d| d == 0).count();
-        let fits_i8 = deltas.iter().filter(|&&d| (-128..=127).contains(&d)).count();
-        let fits_i16 = deltas.iter().filter(|&&d| (-32768..=32767).contains(&d)).count();
+        let fits_i8 = deltas
+            .iter()
+            .filter(|&&d| (-128..=127).contains(&d))
+            .count();
+        let fits_i16 = deltas
+            .iter()
+            .filter(|&&d| (-32768..=32767).contains(&d))
+            .count();
 
         eprintln!("\n=== Delta Analysis (repo_pair_idx) ===");
         eprintln!("  Delta range:   {delta_min} to {delta_max}");
-        eprintln!("  Zero deltas:   {:>10} ({:.1}%) [same repo]", zeros, zeros as f64 / deltas.len() as f64 * 100.0);
-        eprintln!("  Fits in i8:    {:>10} ({:.1}%)", fits_i8, fits_i8 as f64 / deltas.len() as f64 * 100.0);
-        eprintln!("  Fits in i16:   {:>10} ({:.1}%)", fits_i16, fits_i16 as f64 / deltas.len() as f64 * 100.0);
+        eprintln!(
+            "  Zero deltas:   {:>10} ({:.1}%) [same repo]",
+            zeros,
+            zeros as f64 / deltas.len() as f64 * 100.0
+        );
+        eprintln!(
+            "  Fits in i8:    {:>10} ({:.1}%)",
+            fits_i8,
+            fits_i8 as f64 / deltas.len() as f64 * 100.0
+        );
+        eprintln!(
+            "  Fits in i16:   {:>10} ({:.1}%)",
+            fits_i16,
+            fits_i16 as f64 / deltas.len() as f64 * 100.0
+        );
 
         // Estimate delta encoding size
-        let delta_bytes: usize = deltas.iter().map(|&d| {
-            if (-128..=127).contains(&d) { 1 }
-            else if (-32768..=32767).contains(&d) { 2 }
-            else { 4 }
-        }).sum();
-        eprintln!("  Delta estimate:{:>10} bytes (vs {} raw u32)", delta_bytes + 4, total * 4);
+        let delta_bytes: usize = deltas
+            .iter()
+            .map(|&d| {
+                if (-128..=127).contains(&d) {
+                    1
+                } else if (-32768..=32767).contains(&d) {
+                    2
+                } else {
+                    4
+                }
+            })
+            .sum();
+        eprintln!(
+            "  Delta estimate:{:>10} bytes (vs {} raw u32)",
+            delta_bytes + 4,
+            total * 4
+        );
     }
 
     // Varint analysis for raw values
-    let varint_bytes: usize = indices.iter().map(|&v| {
-        if v < 128 { 1 }
-        else if v < 16384 { 2 }
-        else if v < 2097152 { 3 }
-        else { 4 }
-    }).sum();
-    eprintln!("\n  Varint estimate: {:>8} bytes (vs {} raw u32)", varint_bytes, total * 4);
+    let varint_bytes: usize = indices
+        .iter()
+        .map(|&v| {
+            if v < 128 {
+                1
+            } else if v < 16384 {
+                2
+            } else if v < 2097152 {
+                3
+            } else {
+                4
+            }
+        })
+        .sum();
+    eprintln!(
+        "\n  Varint estimate: {:>8} bytes (vs {} raw u32)",
+        varint_bytes,
+        total * 4
+    );
 }
 
-fn print_column_stats(columns: &EncodedColumns, mapping_tsv: &[u8], mapping_compressed_size: usize) {
-    let num_rows = columns.event_id_deltas.len();  // 1 per event
+fn print_column_stats(
+    columns: &EncodedColumns,
+    mapping_tsv: &[u8],
+    mapping_compressed_size: usize,
+) {
+    let num_rows = columns.event_id_deltas.len(); // 1 per event
     eprintln!("\n=== Per-Column Compressed Size Estimates ===");
     eprintln!("Total rows: {num_rows}");
-    eprintln!("{:<20} {:>10} {:>10} {:>8} {:>10}", "Column", "Raw", "Zstd", "Ratio", "B/Row");
+    eprintln!(
+        "{:<20} {:>10} {:>10} {:>8} {:>10}",
+        "Column", "Raw", "Zstd", "Ratio", "B/Row"
+    );
     eprintln!("{}", "-".repeat(64));
 
     let mut total_raw = 0usize;
@@ -1390,7 +1684,9 @@ fn print_column_stats(columns: &EncodedColumns, mapping_tsv: &[u8], mapping_comp
     let mut event_type_buf = Vec::with_capacity(event_type_raw);
     event_type_buf.extend_from_slice(&columns.event_type_dict);
     event_type_buf.extend_from_slice(&columns.event_type_packed);
-    let event_type_compressed = zstd::encode_all(event_type_buf.as_slice(), ZSTD_LEVEL).unwrap().len();
+    let event_type_compressed = zstd::encode_all(event_type_buf.as_slice(), ZSTD_LEVEL)
+        .unwrap()
+        .len();
     total_raw += event_type_raw;
     total_compressed += event_type_compressed;
     eprintln!(
@@ -1404,7 +1700,9 @@ fn print_column_stats(columns: &EncodedColumns, mapping_tsv: &[u8], mapping_comp
 
     // event_id_delta
     let eid_raw = columns.event_id_deltas.len();
-    let eid_compressed = zstd::encode_all(columns.event_id_deltas.as_slice(), ZSTD_LEVEL).unwrap().len();
+    let eid_compressed = zstd::encode_all(columns.event_id_deltas.as_slice(), ZSTD_LEVEL)
+        .unwrap()
+        .len();
     total_raw += eid_raw;
     total_compressed += eid_compressed;
     eprintln!(
@@ -1418,8 +1716,14 @@ fn print_column_stats(columns: &EncodedColumns, mapping_tsv: &[u8], mapping_comp
 
     // repo_pair_idx
     let repo_raw = columns.repo_pair_indices.len() * 4;
-    let repo_bytes: Vec<u8> = columns.repo_pair_indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let repo_compressed = zstd::encode_all(repo_bytes.as_slice(), ZSTD_LEVEL).unwrap().len();
+    let repo_bytes: Vec<u8> = columns
+        .repo_pair_indices
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let repo_compressed = zstd::encode_all(repo_bytes.as_slice(), ZSTD_LEVEL)
+        .unwrap()
+        .len();
     total_raw += repo_raw;
     total_compressed += repo_compressed;
     eprintln!(
@@ -1433,8 +1737,14 @@ fn print_column_stats(columns: &EncodedColumns, mapping_tsv: &[u8], mapping_comp
 
     // created_at_delta
     let ts_raw = columns.created_at_deltas.len() * 2;
-    let ts_bytes: Vec<u8> = columns.created_at_deltas.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let ts_compressed = zstd::encode_all(ts_bytes.as_slice(), ZSTD_LEVEL).unwrap().len();
+    let ts_bytes: Vec<u8> = columns
+        .created_at_deltas
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let ts_compressed = zstd::encode_all(ts_bytes.as_slice(), ZSTD_LEVEL)
+        .unwrap()
+        .len();
     total_raw += ts_raw;
     total_compressed += ts_compressed;
     eprintln!(
@@ -1472,10 +1782,37 @@ fn print_column_stats(columns: &EncodedColumns, mapping_tsv: &[u8], mapping_comp
     // Value statistics (unpack for analysis)
     let event_type_indices = unpack_nibbles(&columns.event_type_packed, num_rows);
     eprintln!("\n=== Value Statistics ===");
-    print_value_stats_unsigned("event_type_idx", &event_type_indices.iter().map(|&v| v as u64).collect::<Vec<_>>());
-    print_value_stats_unsigned("event_id_delta", &columns.event_id_deltas.iter().map(|&v| v as u64).collect::<Vec<_>>());
-    print_value_stats_unsigned("repo_pair_idx", &columns.repo_pair_indices.iter().map(|&v| v as u64).collect::<Vec<_>>());
-    print_value_stats_signed("created_at_delta", &columns.created_at_deltas.iter().map(|&v| v as i64).collect::<Vec<_>>());
+    print_value_stats_unsigned(
+        "event_type_idx",
+        &event_type_indices
+            .iter()
+            .map(|&v| v as u64)
+            .collect::<Vec<_>>(),
+    );
+    print_value_stats_unsigned(
+        "event_id_delta",
+        &columns
+            .event_id_deltas
+            .iter()
+            .map(|&v| v as u64)
+            .collect::<Vec<_>>(),
+    );
+    print_value_stats_unsigned(
+        "repo_pair_idx",
+        &columns
+            .repo_pair_indices
+            .iter()
+            .map(|&v| v as u64)
+            .collect::<Vec<_>>(),
+    );
+    print_value_stats_signed(
+        "created_at_delta",
+        &columns
+            .created_at_deltas
+            .iter()
+            .map(|&v| v as i64)
+            .collect::<Vec<_>>(),
+    );
 
     // Event type distribution and RLE analysis
     print_event_type_distribution(&columns.event_type_dict, &event_type_indices);

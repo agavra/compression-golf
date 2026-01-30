@@ -9,8 +9,8 @@ mod fabinout;
 mod hachikuji;
 mod jakedgy;
 mod naive;
-mod samsond;
 mod natebrennand;
+mod samsond;
 mod xiangpenghao;
 mod zstd;
 
@@ -20,8 +20,8 @@ use fabinout::FabinoutCodec;
 use hachikuji::HachikujiCodec;
 use jakedgy::JakedgyCodec;
 use naive::NaiveCodec;
-use samsond::SamsondCodec;
 use natebrennand::NatebrennandCodec;
+use samsond::SamsondCodec;
 use xiangpenghao::XiangpengHaoCodec;
 use zstd::ZstdCodec;
 
