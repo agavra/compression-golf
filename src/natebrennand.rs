@@ -11,23 +11,24 @@
 //!
 //! Strategy:
 //! - Dictionary encode event_type (14 unique values)
-//! - Store unique (repo_id, repo_name) pairs in a TSV mapping table
-//! - Per event, store only an index into the mapping table
+//! - Store unique (repo_id, repo_name) pairs in binary mapping table (ID-sorted)
+//! - Per event, store only an index into the mapping table (24-bit packed)
 //! - Store first event_id in header, deltas as u8 (max delta is 251)
-//! - Store first timestamp in header, deltas as i16 (range -2540 to +2540)
+//! - Store first timestamp in header, deltas as varint-encoded i16
 //! - Reconstruct repo.url from repo.name during decode
 //! - Compress each column separately with zstd level 22
 //!
 //! Binary format:
-//!   Header (52 bytes, uncompressed):
+//!   Header (56 bytes, uncompressed):
 //!     - first_event_id: u64
 //!     - first_timestamp: i64
 //!     - num_events: u32
-//!     - mapping_size: u32 (uncompressed)
+//!     - num_mapping_entries: u32
 //!     - event_type_dict_size: u16 (uncompressed)
 //!     - num_event_types: u8
 //!     - _padding: u8
-//!     - mapping_compressed: u32
+//!     - mapping_ids_compressed: u32
+//!     - mapping_names_compressed: u32
 //!     - dict_compressed: u32
 //!     - packed_compressed: u32
 //!     - id_deltas_compressed: u32
@@ -35,31 +36,39 @@
 //!     - ts_compressed: u32
 //!
 //!   Per-column compressed payloads (zstd-22, concatenated):
-//!     1. mapping TSV (repo_id\trepo_name\n)
-//!     2. event_type dict (newline-separated strings)
-//!     3. event_type indices: 4-bit packed [(num_events+1)/2 bytes]
-//!     4. event_id deltas: [u8; num_events]
-//!     5. repo_pair indices: [u32-le; num_events]
-//!     6. created_at deltas: [i16-le; num_events]
+//!     1. mapping IDs: varint delta-encoded repo_ids (sorted by ID)
+//!     2. mapping names: newline-separated repo names (in ID order)
+//!     3. event_type dict (newline-separated strings)
+//!     4. event_type indices: 4-bit packed [(num_events+1)/2 bytes]
+//!     5. event_id deltas: [u8; num_events]
+//!     6. repo_pair indices: 24-bit packed [3 bytes each]
+//!     7. created_at deltas: zigzag + varint encoded
 //!
 //! Compression techniques - what worked:
+//!   - Binary mapping format: Store (repo_id, repo_name) pairs as two separate columns:
+//!     IDs sorted and delta+varint encoded, names newline-separated. Sorting by repo_id
+//!     makes ID deltas small (varint-compressible). Separating IDs from names allows
+//!     zstd to compress each optimally. Saves 734KB (11%) vs TSV format.
 //!   - Per-column zstd compression: Compress each column separately instead of
 //!     concatenating then compressing. Each column has different statistical properties
 //!     (text vs integers, different value ranges) that benefit from independent
 //!     compression contexts. Saves ~27KB (0.4%) vs combined compression.
+//!   - 24-bit packing for repo_pair_idx: Indices fit in 18 bits (max 262K repos), but
+//!     byte-aligned 24-bit packing compresses better than true bit-packing because
+//!     zstd works on bytes. Saves 100KB vs u32.
+//!   - Varint for timestamp deltas: 99.9% of deltas fit in 1 byte after zigzag encoding.
+//!     Saves 3.8KB vs fixed i16.
 //!   - Delta encoding for event_id: Sorting by event_id makes deltas small (max 251),
 //!     fitting in u8. Compresses to 0.35 B/row.
-//!   - Delta encoding for timestamps: Correlated with event_id, deltas fit in i16
-//!     (99.9% fit in i8). Compresses to 0.04 B/row.
 //!   - Dictionary encoding for event_type: 15 unique values, 4-bit packed indices
 //!     (2 per byte). Compresses to 0.22 B/row.
-//!   - TSV mapping table: Store unique (repo_id, repo_name) pairs once, reference
-//!     by u32 index per event. TSV compresses to 3.78 B/row.
-//!   - Alphabetical TSV ordering: Enables zstd to exploit shared prefixes in
-//!     repo names (e.g., "owner/repo1", "owner/repo2").
 //!   - zstd level 22: High compression ratio, acceptable encode time for batch use.
 //!
 //! Compression techniques - what didn't work:
+//!   - TSV mapping format: Storing (repo_id\trepo_name\n) in alphabetical order.
+//!     Result: 3.78 B/row. Switched to binary format (ID-sorted, delta-encoded IDs,
+//!     separate names column): 3.04 B/row - saves 734KB (11%). Sorting by ID makes
+//!     deltas small; separating columns lets zstd optimize each independently.
 //!   - RLE for event_type: Data sorted by event_id, not event_type, so runs are
 //!     short (avg 2.09, 67% length 1). RLE saves only 4.1% on raw data, and zstd
 //!     already achieves 25% ratio.
@@ -76,49 +85,30 @@
 //!     The overhead of separate dictionaries outweighs any gains.
 //!   - Frequency-ordered repo indices: Reordering repos by frequency (most common
 //!     first) improved index compression by 60KB (more values fit in smaller bytes),
-//!     but hurt TSV compression by 90KB (lost alphabetical prefix sharing). Net loss.
-//!     A remapping table would cost ~1MB (262K repos * 4 bytes).
+//!     but hurt name compression by 90KB (lost prefix sharing). Net loss.
 //!   - Varint for repo_pair_idx: Would use 2.94MB vs zstd's 2.32MB on raw u32.
 //!     zstd's entropy coding already beats simple varint.
 //!   - Delta encoding for repo_pair_idx: Repos are essentially random when sorted
 //!     by event_id (99.6% runs of length 1). Deltas span full range (-262K to +262K),
 //!     only 26% fit in i16. Would use 3.47MB vs zstd's 2.32MB.
-//!   - FST (finite state transducer) for repo mapping: Tried two approaches:
-//!     (a) FST name->idx + separate repo_ids: 4.62 B/row vs TSV's 3.78 B/row
-//!     (b) FST name->(repo_id|variant) with variant in high bits for renamed repos:
-//!         - Only 419 repos (0.2%) have multiple names, max 4 names per ID
-//!         - repo_ids need 30 bits, leaving 2 bits for variant in u32
-//!         - But FST+zstd (4.71 B/row) > TSV+zstd (3.78 B/row)
-//!         - And per-event combined values (2.60 B/row) > sequential indices (2.32 B/row)
-//!         - Total: 7.31 B/row vs current 6.10 B/row - 16.6% worse
-//!     Conclusion: zstd's prefix compression on alphabetical TSV beats FST, and
-//!     sequential indices compress better than scattered repo_ids.
-//!   - RSMarisa trie for repo names: Pure Rust port of marisa-trie (MARISA = Matching
-//!     Algorithm with Recursively Implemented StorAge). Tried storing repo names in a
-//!     static trie, then storing trie lookup indices per event.
-//!     - Built trie from 262K unique repo names using Keyset/Trie API
-//!     - Stored serialized trie in compressed payload (trie_size in header)
-//!     - Per event, stored u32 trie index from lookup()
-//!     - Result: 8,460,472 bytes (8.46 B/row)
-//!     - Switched to TSV mapping: 6,733,425 bytes (6.73 B/row) - 20% improvement
-//!       Conclusion: TSV + zstd beats trie because zstd already exploits alphabetical
-//!       prefix sharing in sorted TSV entries. The trie's space-efficient structure
-//!       doesn't help when the whole thing gets zstd-compressed anyway.
+//!   - FST (finite state transducer) for repo mapping: 7.31 B/row vs binary's 3.04 B/row.
+//!     zstd's compression beats FST's space-efficient structure.
+//!   - RSMarisa trie for repo names: 8.46 B/row vs binary's 3.04 B/row. The trie's
+//!     structure doesn't help when the whole thing gets zstd-compressed anyway.
 //!   - Combined column compression: Concatenating all columns then compressing as one
-//!     zstd stream gives 6,731,013 bytes vs per-column's 6,704,316 bytes. The
-//!     heterogeneous data types (text, u8, u32, i16) hurt each other when combined.
+//!     zstd stream. Heterogeneous data types hurt each other when combined.
 //!   - zstd parameter tuning: Tested window_log (17-30), pledged_src_size, and checksum.
 //!     Default L22 settings (window_log=27, no checksum) are already optimal.
-//!     Smaller windows hurt significantly; pledged size adds overhead.
 //!
 //! Current results (1M events):
-//!   - event_type:       0.22 B/row (4-bit packed)
-//!   - event_id_delta:   0.35 B/row
-//!   - repo_pair_idx:    2.32 B/row
-//!   - created_at_delta: 0.04 B/row
-//!   - repo mapping TSV: 3.78 B/row
-//!   - Header:           52 bytes (stores compressed sizes for each column)
-//!   - TOTAL:            6.70 B/row (6,704,368 bytes)
+//!   - event_type:       0.22 B/row (4-bit packed + zstd)
+//!   - event_id_delta:   0.35 B/row (u8 + zstd)
+//!   - repo_pair_idx:    2.32 B/row (24-bit + zstd)
+//!   - created_at_delta: 0.04 B/row (varint + zstd)
+//!   - mapping IDs:      0.06 B/row (delta + varint + zstd)
+//!   - mapping names:    2.98 B/row (newline-sep + zstd)
+//!   - Header:           56 bytes
+//!   - TOTAL:            6.00 B/row (5,996,774 bytes, -97.2% vs naive)
 //!
 //! Set NATE_DEBUG=1 to see column size statistics and compression experiments.
 
@@ -242,6 +232,91 @@ fn pack_bits(values: &[u32], bits_per_value: u32) -> Vec<u8> {
         bit_pos += bits_per_value as u64;
     }
     result
+}
+
+/// Experiment with delta encoding repo_ids in mapping table
+fn experiment_mapping_formats(mapping_tsv: &[u8]) {
+    eprintln!("\n=== Mapping Format Experiment ===");
+
+    // Parse current TSV
+    let tsv_str = std::str::from_utf8(mapping_tsv).unwrap();
+    let mut entries: Vec<(u32, &str)> = Vec::new();
+    for line in tsv_str.lines() {
+        if let Some((id_str, name)) = line.split_once('\t') {
+            if let Ok(id) = id_str.parse::<u32>() {
+                entries.push((id, name));
+            }
+        }
+    }
+
+    let current_compressed = zstd::encode_all(mapping_tsv, ZSTD_LEVEL).unwrap().len();
+    eprintln!("Current TSV (alpha sorted): {} bytes compressed", current_compressed);
+
+    // Option 1: Sort by repo_id, delta encode IDs
+    let mut by_id = entries.clone();
+    by_id.sort_by_key(|(id, _)| *id);
+
+    let mut delta_tsv = String::new();
+    let mut prev_id: u32 = 0;
+    for (id, name) in &by_id {
+        let delta = id - prev_id;
+        delta_tsv.push_str(&format!("{}\t{}\n", delta, name));
+        prev_id = *id;
+    }
+    let delta_compressed = zstd::encode_all(delta_tsv.as_bytes(), ZSTD_LEVEL).unwrap().len();
+    eprintln!("ID-sorted + delta TSV:      {} bytes ({:+})",
+        delta_compressed, delta_compressed as i64 - current_compressed as i64);
+
+    // Option 2: Binary format - separate columns for IDs and names
+    // IDs as delta-encoded varints, names as newline-separated
+    let mut id_deltas: Vec<u32> = Vec::new();
+    prev_id = 0;
+    for (id, _) in &by_id {
+        id_deltas.push(id - prev_id);
+        prev_id = *id;
+    }
+
+    // Varint encode the deltas
+    let mut id_bytes: Vec<u8> = Vec::new();
+    for delta in &id_deltas {
+        let mut val = *delta;
+        loop {
+            if val < 128 {
+                id_bytes.push(val as u8);
+                break;
+            }
+            id_bytes.push((val as u8 & 0x7f) | 0x80);
+            val >>= 7;
+        }
+    }
+
+    let names: Vec<&str> = by_id.iter().map(|(_, n)| *n).collect();
+    let names_bytes = names.join("\n").into_bytes();
+
+    let id_compressed = zstd::encode_all(id_bytes.as_slice(), ZSTD_LEVEL).unwrap().len();
+    let names_compressed = zstd::encode_all(names_bytes.as_slice(), ZSTD_LEVEL).unwrap().len();
+    let binary_total = id_compressed + names_compressed;
+
+    eprintln!("Binary (ID-sorted):");
+    eprintln!("  ID deltas (varint):       {} -> {} compressed", id_bytes.len(), id_compressed);
+    eprintln!("  Names:                    {} -> {} compressed", names_bytes.len(), names_compressed);
+    eprintln!("  Total:                    {} bytes ({:+})",
+        binary_total, binary_total as i64 - current_compressed as i64);
+
+    // Option 3: Keep alpha sort, but binary format (separate ID column)
+    let names_alpha: Vec<&str> = entries.iter().map(|(_, n)| *n).collect();
+    let names_alpha_bytes = names_alpha.join("\n").into_bytes();
+    let ids_alpha: Vec<u8> = entries.iter().flat_map(|(id, _)| id.to_le_bytes()[..3].to_vec()).collect();
+
+    let names_alpha_compressed = zstd::encode_all(names_alpha_bytes.as_slice(), ZSTD_LEVEL).unwrap().len();
+    let ids_alpha_compressed = zstd::encode_all(ids_alpha.as_slice(), ZSTD_LEVEL).unwrap().len();
+    let binary_alpha_total = names_alpha_compressed + ids_alpha_compressed;
+
+    eprintln!("Binary (alpha-sorted):");
+    eprintln!("  IDs (24-bit):             {} -> {} compressed", ids_alpha.len(), ids_alpha_compressed);
+    eprintln!("  Names:                    {} -> {} compressed", names_alpha_bytes.len(), names_alpha_compressed);
+    eprintln!("  Total:                    {} bytes ({:+})",
+        binary_alpha_total, binary_alpha_total as i64 - current_compressed as i64);
 }
 
 /// Experiment with variable-width timestamp deltas
@@ -1085,12 +1160,13 @@ fn format_timestamp(ts: i64) -> String {
 ///   - first_event_id: u64
 ///   - first_timestamp: i64
 ///   - num_events: u32
-///   - mapping_size: u32 (uncompressed TSV size)
+///   - num_mapping_entries: u32 (number of repo entries)
 ///   - event_type_dict_size: u16 (uncompressed)
 ///   - num_event_types: u8
 ///   - _padding: u8
-/// Compressed sizes (24 bytes):
-///   - mapping_compressed: u32
+/// Compressed sizes (28 bytes):
+///   - mapping_ids_compressed: u32
+///   - mapping_names_compressed: u32
 ///   - dict_compressed: u32
 ///   - packed_compressed: u32
 ///   - id_deltas_compressed: u32
@@ -1100,11 +1176,12 @@ struct Header {
     first_event_id: u64,
     first_timestamp: i64,
     num_events: u32,
-    mapping_size: u32,
+    num_mapping_entries: u32,
     event_type_dict_size: u16,
     num_event_types: u8,
     // Compressed sizes for each column
-    mapping_compressed: u32,
+    mapping_ids_compressed: u32,
+    mapping_names_compressed: u32,
     dict_compressed: u32,
     packed_compressed: u32,
     id_deltas_compressed: u32,
@@ -1112,7 +1189,7 @@ struct Header {
     ts_compressed: u32,
 }
 
-const HEADER_SIZE: usize = 52; // 8 + 8 + 4 + 4 + 2 + 1 + 1 + (6 * 4)
+const HEADER_SIZE: usize = 56; // 8 + 8 + 4 + 4 + 2 + 1 + 1 + (7 * 4)
 
 impl Header {
     fn encode(&self) -> [u8; HEADER_SIZE] {
@@ -1125,7 +1202,7 @@ impl Header {
         pos += 8;
         buf[pos..pos+4].copy_from_slice(&self.num_events.to_le_bytes());
         pos += 4;
-        buf[pos..pos+4].copy_from_slice(&self.mapping_size.to_le_bytes());
+        buf[pos..pos+4].copy_from_slice(&self.num_mapping_entries.to_le_bytes());
         pos += 4;
         buf[pos..pos+2].copy_from_slice(&self.event_type_dict_size.to_le_bytes());
         pos += 2;
@@ -1135,7 +1212,9 @@ impl Header {
         pos += 1;
 
         // Compressed sizes
-        buf[pos..pos+4].copy_from_slice(&self.mapping_compressed.to_le_bytes());
+        buf[pos..pos+4].copy_from_slice(&self.mapping_ids_compressed.to_le_bytes());
+        pos += 4;
+        buf[pos..pos+4].copy_from_slice(&self.mapping_names_compressed.to_le_bytes());
         pos += 4;
         buf[pos..pos+4].copy_from_slice(&self.dict_compressed.to_le_bytes());
         pos += 4;
@@ -1159,14 +1238,16 @@ impl Header {
         pos += 8;
         let num_events = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
         pos += 4;
-        let mapping_size = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        let num_mapping_entries = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
         pos += 4;
         let event_type_dict_size = u16::from_le_bytes(bytes[pos..pos+2].try_into().unwrap());
         pos += 2;
         let num_event_types = bytes[pos];
         pos += 2; // skip num_event_types + padding
 
-        let mapping_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        let mapping_ids_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        pos += 4;
+        let mapping_names_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
         pos += 4;
         let dict_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
         pos += 4;
@@ -1182,10 +1263,11 @@ impl Header {
             first_event_id,
             first_timestamp,
             num_events,
-            mapping_size,
+            num_mapping_entries,
             event_type_dict_size,
             num_event_types,
-            mapping_compressed,
+            mapping_ids_compressed,
+            mapping_names_compressed,
             dict_compressed,
             packed_compressed,
             id_deltas_compressed,
@@ -1229,9 +1311,10 @@ fn unpack_nibbles(packed: &[u8], count: usize) -> Vec<u8> {
     values
 }
 
-/// Build TSV mapping table from events, returns (tsv_bytes, pair_to_idx mapping)
-/// Repos are sorted alphabetically for better zstd compression (shared prefixes).
-fn build_mapping_table(events: &[(EventKey, EventValue)]) -> (Vec<u8>, HashMap<(u32, String), u32>) {
+/// Build binary mapping table from events
+/// Returns (id_deltas_varint, names_bytes, pair_to_idx mapping)
+/// Repos are sorted by repo_id for optimal delta encoding of IDs.
+fn build_mapping_table(events: &[(EventKey, EventValue)]) -> (Vec<u8>, Vec<u8>, HashMap<(u32, String), u32>) {
     // Collect unique (repo_id, repo_name) pairs
     let mut unique_pairs: Vec<(u32, String)> = events
         .iter()
@@ -1240,32 +1323,72 @@ fn build_mapping_table(events: &[(EventKey, EventValue)]) -> (Vec<u8>, HashMap<(
         .into_iter()
         .collect();
 
-    // Sort alphabetically for better TSV compression (shared prefixes)
-    unique_pairs.sort();
+    // Sort by repo_id for optimal delta encoding
+    unique_pairs.sort_by_key(|(id, _)| *id);
 
-    // Build TSV and index mapping
-    let mut tsv = String::new();
+    // Build index mapping and collect data
     let mut pair_to_idx: HashMap<(u32, String), u32> = HashMap::new();
+    let mut names: Vec<&str> = Vec::with_capacity(unique_pairs.len());
 
     for (idx, (repo_id, repo_name)) in unique_pairs.iter().enumerate() {
-        tsv.push_str(&format!("{repo_id}\t{repo_name}\n"));
         pair_to_idx.insert((*repo_id, repo_name.clone()), idx as u32);
+        names.push(repo_name);
     }
 
-    (tsv.into_bytes(), pair_to_idx)
+    // Delta-encode IDs as varints
+    let mut id_deltas: Vec<u8> = Vec::new();
+    let mut prev_id: u32 = 0;
+    for (repo_id, _) in &unique_pairs {
+        let delta = repo_id - prev_id;
+        // Varint encode
+        let mut val = delta;
+        loop {
+            if val < 128 {
+                id_deltas.push(val as u8);
+                break;
+            }
+            id_deltas.push((val as u8 & 0x7f) | 0x80);
+            val >>= 7;
+        }
+        prev_id = *repo_id;
+    }
+
+    // Names as newline-separated
+    let names_bytes = names.join("\n").into_bytes();
+
+    (id_deltas, names_bytes, pair_to_idx)
 }
 
-/// Parse TSV mapping table, returns Vec of (repo_id, repo_name) pairs
-fn parse_mapping_table(tsv_bytes: &[u8]) -> Vec<(u32, String)> {
-    let tsv = std::str::from_utf8(tsv_bytes).unwrap();
-    tsv.lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            let mut parts = line.split('\t');
-            let repo_id: u32 = parts.next().unwrap().parse().unwrap();
-            let repo_name = parts.next().unwrap().to_string();
-            (repo_id, repo_name)
-        })
+/// Parse binary mapping table, returns Vec of (repo_id, repo_name) pairs
+fn parse_mapping_table(id_bytes: &[u8], names_bytes: &[u8], num_entries: usize) -> Vec<(u32, String)> {
+    // Decode varint delta-encoded IDs
+    let mut ids = Vec::with_capacity(num_entries);
+    let mut pos = 0;
+    let mut prev_id: u32 = 0;
+    for _ in 0..num_entries {
+        let mut val: u32 = 0;
+        let mut shift = 0;
+        loop {
+            let b = id_bytes[pos];
+            pos += 1;
+            val |= ((b & 0x7f) as u32) << shift;
+            if b < 128 {
+                break;
+            }
+            shift += 7;
+        }
+        prev_id += val;
+        ids.push(prev_id);
+    }
+
+    // Parse newline-separated names
+    let names_str = std::str::from_utf8(names_bytes).unwrap();
+    let names: Vec<&str> = names_str.split('\n').collect();
+
+    // Combine into pairs
+    ids.into_iter()
+        .zip(names.into_iter())
+        .map(|(id, name)| (id, name.to_string()))
         .collect()
 }
 
@@ -1350,10 +1473,11 @@ fn build_event_type_dict(event_types: &[&str]) -> (Vec<u8>, Vec<u8>, HashMap<Str
     (dict_bytes, indices, str_to_idx)
 }
 
-/// Returns (base_info, mapping_tsv, columns) where base_info is (first_event_id, first_timestamp, num_events, mapping_size, num_event_types)
-fn encode_events(events: &[(EventKey, EventValue)]) -> Result<((u64, i64, u32, u32, u8), Vec<u8>, EncodedColumns), Box<dyn Error>> {
-    // Build mapping table first
-    let (mapping_tsv, pair_to_idx) = build_mapping_table(events);
+/// Returns (base_info, mapping_ids, mapping_names, columns) where base_info is (first_event_id, first_timestamp, num_events, num_mapping_entries, num_event_types)
+fn encode_events(events: &[(EventKey, EventValue)]) -> Result<((u64, i64, u32, u32, u8), Vec<u8>, Vec<u8>, EncodedColumns), Box<dyn Error>> {
+    // Build mapping table first (binary format: ID deltas + names)
+    let (mapping_ids, mapping_names, pair_to_idx) = build_mapping_table(events);
+    let num_mapping_entries = pair_to_idx.len();
 
     // Sort by event_id for optimal delta encoding
     let mut sorted_indices: Vec<usize> = (0..events.len()).collect();
@@ -1402,11 +1526,11 @@ fn encode_events(events: &[(EventKey, EventValue)]) -> Result<((u64, i64, u32, u
         event_ids[0],           // first_event_id
         timestamps[0],          // first_timestamp
         events.len() as u32,    // num_events
-        mapping_tsv.len() as u32, // mapping_size (uncompressed)
+        num_mapping_entries as u32, // num_mapping_entries
         num_event_types,
     );
 
-    Ok((base_info, mapping_tsv, columns))
+    Ok((base_info, mapping_ids, mapping_names, columns))
 }
 
 /// Decode events from raw column data
@@ -1461,8 +1585,8 @@ impl EventCodec for NatebrennandCodec {
     }
 
     fn encode(&self, events: &[(EventKey, EventValue)]) -> Result<Bytes, Box<dyn Error>> {
-        let (base_info, mapping_tsv, columns) = encode_events(events)?;
-        let (first_event_id, first_timestamp, num_events, mapping_size, num_event_types) = base_info;
+        let (base_info, mapping_ids, mapping_names, columns) = encode_events(events)?;
+        let (first_event_id, first_timestamp, num_events, num_mapping_entries, num_event_types) = base_info;
 
         // Convert columns to bytes
         let repo_bytes: Vec<u8> = pack_u24(&columns.repo_pair_indices);  // 24-bit packing
@@ -1471,18 +1595,11 @@ impl EventCodec for NatebrennandCodec {
         if debug_enabled() {
             experiment_timestamp_encoding(&columns.created_at_deltas);
             experiment_repo_bit_packing(&columns.repo_pair_indices);
-            experiment_compression_strategies(
-                &mapping_tsv,
-                &columns.event_type_dict,
-                &columns.event_type_packed,
-                &columns.event_id_deltas,
-                &repo_bytes,
-                &ts_bytes,
-            );
         }
 
-        // Compress each column separately
-        let mapping_compressed = zstd::encode_all(mapping_tsv.as_slice(), ZSTD_LEVEL)?;
+        // Compress each column separately (mapping split into IDs and names)
+        let mapping_ids_compressed = zstd::encode_all(mapping_ids.as_slice(), ZSTD_LEVEL)?;
+        let mapping_names_compressed = zstd::encode_all(mapping_names.as_slice(), ZSTD_LEVEL)?;
         let dict_compressed = zstd::encode_all(columns.event_type_dict.as_slice(), ZSTD_LEVEL)?;
         let packed_compressed = zstd::encode_all(columns.event_type_packed.as_slice(), ZSTD_LEVEL)?;
         let id_deltas_compressed = zstd::encode_all(columns.event_id_deltas.as_slice(), ZSTD_LEVEL)?;
@@ -1494,10 +1611,11 @@ impl EventCodec for NatebrennandCodec {
             first_event_id,
             first_timestamp,
             num_events,
-            mapping_size,
+            num_mapping_entries,
             event_type_dict_size: columns.event_type_dict.len() as u16,
             num_event_types,
-            mapping_compressed: mapping_compressed.len() as u32,
+            mapping_ids_compressed: mapping_ids_compressed.len() as u32,
+            mapping_names_compressed: mapping_names_compressed.len() as u32,
             dict_compressed: dict_compressed.len() as u32,
             packed_compressed: packed_compressed.len() as u32,
             id_deltas_compressed: id_deltas_compressed.len() as u32,
@@ -1509,16 +1627,17 @@ impl EventCodec for NatebrennandCodec {
             eprintln!("\n=== Header ({HEADER_SIZE} bytes) ===");
             eprintln!("  first_event_id:       {}", header.first_event_id);
             eprintln!("  first_timestamp:      {} ({})", header.first_timestamp, format_timestamp(header.first_timestamp));
-            eprintln!("  mapping_size:         {}", header.mapping_size);
+            eprintln!("  num_mapping_entries:  {}", header.num_mapping_entries);
             eprintln!("  num_events:           {}", header.num_events);
             eprintln!("  event_type_dict_size: {}", header.event_type_dict_size);
             eprintln!("  num_event_types:      {}", header.num_event_types);
-
-            print_column_stats(&columns, &mapping_tsv, mapping_compressed.len());
+            eprintln!("  mapping_ids_compressed:   {}", header.mapping_ids_compressed);
+            eprintln!("  mapping_names_compressed: {}", header.mapping_names_compressed);
         }
 
         // Final output: header + compressed columns (concatenated)
-        let total_compressed = mapping_compressed.len()
+        let total_compressed = mapping_ids_compressed.len()
+            + mapping_names_compressed.len()
             + dict_compressed.len()
             + packed_compressed.len()
             + id_deltas_compressed.len()
@@ -1527,7 +1646,8 @@ impl EventCodec for NatebrennandCodec {
 
         let mut buf = Vec::with_capacity(HEADER_SIZE + total_compressed);
         buf.extend_from_slice(&header.encode());
-        buf.extend_from_slice(&mapping_compressed);
+        buf.extend_from_slice(&mapping_ids_compressed);
+        buf.extend_from_slice(&mapping_names_compressed);
         buf.extend_from_slice(&dict_compressed);
         buf.extend_from_slice(&packed_compressed);
         buf.extend_from_slice(&id_deltas_compressed);
@@ -1535,7 +1655,8 @@ impl EventCodec for NatebrennandCodec {
         buf.extend_from_slice(&ts_compressed);
 
         if debug_enabled() {
-            let payload_size = mapping_tsv.len()
+            let payload_size = mapping_ids.len()
+                + mapping_names.len()
                 + columns.event_type_dict.len()
                 + columns.event_type_packed.len()
                 + columns.event_id_deltas.len()
@@ -1555,13 +1676,24 @@ impl EventCodec for NatebrennandCodec {
         // Decompress each column separately using sizes from header
         let mut offset = HEADER_SIZE;
 
-        // 1. Mapping TSV
-        let mapping_compressed = &bytes[offset..offset + header.mapping_compressed as usize];
-        offset += header.mapping_compressed as usize;
-        let mapping_bytes = zstd::decode_all(mapping_compressed)?;
-        let mapping = parse_mapping_table(&mapping_bytes);
+        // 1. Mapping IDs (varint delta-encoded)
+        let mapping_ids_compressed = &bytes[offset..offset + header.mapping_ids_compressed as usize];
+        offset += header.mapping_ids_compressed as usize;
+        let mapping_ids_bytes = zstd::decode_all(mapping_ids_compressed)?;
 
-        // 2. Event type dictionary
+        // 2. Mapping names (newline-separated)
+        let mapping_names_compressed = &bytes[offset..offset + header.mapping_names_compressed as usize];
+        offset += header.mapping_names_compressed as usize;
+        let mapping_names_bytes = zstd::decode_all(mapping_names_compressed)?;
+
+        // Parse binary mapping table
+        let mapping = parse_mapping_table(
+            &mapping_ids_bytes,
+            &mapping_names_bytes,
+            header.num_mapping_entries as usize,
+        );
+
+        // 3. Event type dictionary
         let dict_compressed = &bytes[offset..offset + header.dict_compressed as usize];
         offset += header.dict_compressed as usize;
         let dict_bytes = zstd::decode_all(dict_compressed)?;
@@ -1570,25 +1702,25 @@ impl EventCodec for NatebrennandCodec {
             .map(|s| s.to_string())
             .collect();
 
-        // 3. Event type indices (4-bit packed)
+        // 4. Event type indices (4-bit packed)
         let packed_compressed = &bytes[offset..offset + header.packed_compressed as usize];
         offset += header.packed_compressed as usize;
         let packed_bytes = zstd::decode_all(packed_compressed)?;
         let num_events = header.num_events as usize;
         let event_type_indices = unpack_nibbles(&packed_bytes, num_events);
 
-        // 4. Event ID deltas
+        // 5. Event ID deltas
         let id_deltas_compressed = &bytes[offset..offset + header.id_deltas_compressed as usize];
         offset += header.id_deltas_compressed as usize;
         let event_id_deltas = zstd::decode_all(id_deltas_compressed)?;
 
-        // 5. Repo pair indices (24-bit packed)
+        // 6. Repo pair indices (24-bit packed)
         let repo_compressed = &bytes[offset..offset + header.repo_compressed as usize];
         offset += header.repo_compressed as usize;
         let repo_bytes = zstd::decode_all(repo_compressed)?;
         let repo_pair_indices = unpack_u24(&repo_bytes, num_events);
 
-        // 6. Created at deltas (varint encoded)
+        // 7. Created at deltas (varint encoded)
         let ts_compressed = &bytes[offset..offset + header.ts_compressed as usize];
         let ts_bytes = zstd::decode_all(ts_compressed)?;
         let created_at_deltas = decode_varint_i16(&ts_bytes, num_events);
