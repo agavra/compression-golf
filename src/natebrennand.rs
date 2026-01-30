@@ -67,6 +67,9 @@
 //!     theoretical minimum 220KB. Current 4-bit + zstd achieves 223KB - already
 //!     within 1.5% of theoretical optimum. Huffman would give ~279KB raw, and
 //!     zstd can't compress it further since it's already entropy-coded.
+//!   - Frequency-ordered event_type indices: Reordering dictionary so most common
+//!     types (PushEvent=68.9%) get index 0 instead of 12. Result: +4 bytes worse.
+//!     zstd already handles the patterns efficiently with alphabetical ordering.
 //!   - Frequency-ordered repo indices: Reordering repos by frequency (most common
 //!     first) improved index compression by 60KB (more values fit in smaller bytes),
 //!     but hurt TSV compression by 90KB (lost alphabetical prefix sharing). Net loss.
