@@ -123,22 +123,6 @@ use crate::{EventKey, EventValue, Repo};
 
 const ZSTD_LEVEL: i32 = 22;
 
-/// Compress with custom zstd parameters
-fn compress_with_params(data: &[u8], level: i32, window_log: Option<u32>, pledged_size: bool, checksum: bool) -> Vec<u8> {
-    use std::io::Write;
-    let mut encoder = zstd::Encoder::new(Vec::new(), level).unwrap();
-
-    if let Some(wl) = window_log {
-        encoder.set_parameter(zstd::zstd_safe::CParameter::WindowLog(wl)).ok();
-    }
-    if pledged_size {
-        encoder.set_pledged_src_size(Some(data.len() as u64)).ok();
-    }
-    encoder.include_checksum(checksum).ok();
-
-    encoder.write_all(data).unwrap();
-    encoder.finish().unwrap()
-}
 
 /// Pack u32 values into 24-bit (3 byte) little-endian format
 fn pack_u24(values: &[u32]) -> Vec<u8> {
@@ -204,6 +188,636 @@ fn decode_varint_i16(bytes: &[u8], count: usize) -> Vec<i16> {
         result.push(decoded as i16);
     }
     result
+}
+
+
+pub struct NatebrennandCodec;
+
+impl NatebrennandCodec {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+fn parse_timestamp(ts: &str) -> i64 {
+    DateTime::parse_from_rfc3339(ts)
+        .map(|dt| dt.timestamp())
+        .unwrap_or(0)
+}
+
+fn format_timestamp(ts: i64) -> String {
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_default()
+}
+
+/// Header for per-column compressed format
+/// Base fields (28 bytes):
+///   - first_event_id: u64
+///   - first_timestamp: i64
+///   - num_events: u32
+///   - num_mapping_entries: u32 (number of repo entries)
+///   - event_type_dict_size: u16 (uncompressed)
+///   - num_event_types: u8
+///   - _padding: u8
+/// Compressed sizes (28 bytes):
+///   - mapping_ids_compressed: u32
+///   - mapping_names_compressed: u32
+///   - dict_compressed: u32
+///   - packed_compressed: u32
+///   - id_deltas_compressed: u32
+///   - repo_compressed: u32
+///   - ts_compressed: u32
+struct Header {
+    first_event_id: u64,
+    first_timestamp: i64,
+    num_events: u32,
+    num_mapping_entries: u32,
+    event_type_dict_size: u16,
+    num_event_types: u8,
+    // Compressed sizes for each column
+    mapping_ids_compressed: u32,
+    mapping_names_compressed: u32,
+    dict_compressed: u32,
+    packed_compressed: u32,
+    id_deltas_compressed: u32,
+    repo_compressed: u32,
+    ts_compressed: u32,
+}
+
+const HEADER_SIZE: usize = 56; // 8 + 8 + 4 + 4 + 2 + 1 + 1 + (7 * 4)
+
+impl Header {
+    fn encode(&self) -> [u8; HEADER_SIZE] {
+        let mut buf = [0u8; HEADER_SIZE];
+        let mut pos = 0;
+
+        buf[pos..pos+8].copy_from_slice(&self.first_event_id.to_le_bytes());
+        pos += 8;
+        buf[pos..pos+8].copy_from_slice(&self.first_timestamp.to_le_bytes());
+        pos += 8;
+        buf[pos..pos+4].copy_from_slice(&self.num_events.to_le_bytes());
+        pos += 4;
+        buf[pos..pos+4].copy_from_slice(&self.num_mapping_entries.to_le_bytes());
+        pos += 4;
+        buf[pos..pos+2].copy_from_slice(&self.event_type_dict_size.to_le_bytes());
+        pos += 2;
+        buf[pos] = self.num_event_types;
+        pos += 1;
+        // padding byte
+        pos += 1;
+
+        // Compressed sizes
+        buf[pos..pos+4].copy_from_slice(&self.mapping_ids_compressed.to_le_bytes());
+        pos += 4;
+        buf[pos..pos+4].copy_from_slice(&self.mapping_names_compressed.to_le_bytes());
+        pos += 4;
+        buf[pos..pos+4].copy_from_slice(&self.dict_compressed.to_le_bytes());
+        pos += 4;
+        buf[pos..pos+4].copy_from_slice(&self.packed_compressed.to_le_bytes());
+        pos += 4;
+        buf[pos..pos+4].copy_from_slice(&self.id_deltas_compressed.to_le_bytes());
+        pos += 4;
+        buf[pos..pos+4].copy_from_slice(&self.repo_compressed.to_le_bytes());
+        pos += 4;
+        buf[pos..pos+4].copy_from_slice(&self.ts_compressed.to_le_bytes());
+
+        buf
+    }
+
+    fn decode(bytes: &[u8]) -> Self {
+        let mut pos = 0;
+
+        let first_event_id = u64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap());
+        pos += 8;
+        let first_timestamp = i64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap());
+        pos += 8;
+        let num_events = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        pos += 4;
+        let num_mapping_entries = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        pos += 4;
+        let event_type_dict_size = u16::from_le_bytes(bytes[pos..pos+2].try_into().unwrap());
+        pos += 2;
+        let num_event_types = bytes[pos];
+        pos += 2; // skip num_event_types + padding
+
+        let mapping_ids_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        pos += 4;
+        let mapping_names_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        pos += 4;
+        let dict_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        pos += 4;
+        let packed_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        pos += 4;
+        let id_deltas_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        pos += 4;
+        let repo_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+        pos += 4;
+        let ts_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+
+        Self {
+            first_event_id,
+            first_timestamp,
+            num_events,
+            num_mapping_entries,
+            event_type_dict_size,
+            num_event_types,
+            mapping_ids_compressed,
+            mapping_names_compressed,
+            dict_compressed,
+            packed_compressed,
+            id_deltas_compressed,
+            repo_compressed,
+            ts_compressed,
+        }
+    }
+}
+
+/// Holds the encoded column data before compression
+struct EncodedColumns {
+    event_type_dict: Vec<u8>,       // newline-separated event type strings
+    event_type_packed: Vec<u8>,     // 4-bit packed indices (2 per byte)
+    event_id_deltas: Vec<u8>,       // u8 deltas
+    repo_pair_indices: Vec<u32>,    // u32 indices
+    created_at_deltas: Vec<i16>,    // i16 deltas
+}
+
+/// Pack 4-bit values into bytes (2 values per byte, low nibble first)
+fn pack_nibbles(values: &[u8]) -> Vec<u8> {
+    let mut packed = Vec::with_capacity((values.len() + 1) / 2);
+    for chunk in values.chunks(2) {
+        let byte = chunk[0] | (chunk.get(1).copied().unwrap_or(0) << 4);
+        packed.push(byte);
+    }
+    packed
+}
+
+/// Unpack 4-bit values from bytes
+fn unpack_nibbles(packed: &[u8], count: usize) -> Vec<u8> {
+    let mut values = Vec::with_capacity(count);
+    for &byte in packed {
+        values.push(byte & 0x0F);
+        if values.len() < count {
+            values.push(byte >> 4);
+        }
+        if values.len() >= count {
+            break;
+        }
+    }
+    values
+}
+
+/// Build binary mapping table from events
+/// Returns (id_deltas_varint, names_bytes, pair_to_idx mapping)
+/// Repos are sorted by repo_id for optimal delta encoding of IDs.
+fn build_mapping_table(events: &[(EventKey, EventValue)]) -> (Vec<u8>, Vec<u8>, HashMap<(u32, String), u32>) {
+    // Collect unique (repo_id, repo_name) pairs
+    let mut unique_pairs: Vec<(u32, String)> = events
+        .iter()
+        .map(|(_, v)| (v.repo.id as u32, v.repo.name.clone()))
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    // Sort by repo_id for optimal delta encoding
+    unique_pairs.sort_by_key(|(id, _)| *id);
+
+    // Build index mapping and collect data
+    let mut pair_to_idx: HashMap<(u32, String), u32> = HashMap::new();
+    let mut names: Vec<&str> = Vec::with_capacity(unique_pairs.len());
+
+    for (idx, (repo_id, repo_name)) in unique_pairs.iter().enumerate() {
+        pair_to_idx.insert((*repo_id, repo_name.clone()), idx as u32);
+        names.push(repo_name);
+    }
+
+    // Delta-encode IDs as varints
+    let mut id_deltas: Vec<u8> = Vec::new();
+    let mut prev_id: u32 = 0;
+    for (repo_id, _) in &unique_pairs {
+        let delta = repo_id - prev_id;
+        // Varint encode
+        let mut val = delta;
+        loop {
+            if val < 128 {
+                id_deltas.push(val as u8);
+                break;
+            }
+            id_deltas.push((val as u8 & 0x7f) | 0x80);
+            val >>= 7;
+        }
+        prev_id = *repo_id;
+    }
+
+    // Names as newline-separated
+    let names_bytes = names.join("\n").into_bytes();
+
+    (id_deltas, names_bytes, pair_to_idx)
+}
+
+/// Parse binary mapping table, returns Vec of (repo_id, repo_name) pairs
+fn parse_mapping_table(id_bytes: &[u8], names_bytes: &[u8], num_entries: usize) -> Vec<(u32, String)> {
+    // Decode varint delta-encoded IDs
+    let mut ids = Vec::with_capacity(num_entries);
+    let mut pos = 0;
+    let mut prev_id: u32 = 0;
+    for _ in 0..num_entries {
+        let mut val: u32 = 0;
+        let mut shift = 0;
+        loop {
+            let b = id_bytes[pos];
+            pos += 1;
+            val |= ((b & 0x7f) as u32) << shift;
+            if b < 128 {
+                break;
+            }
+            shift += 7;
+        }
+        prev_id += val;
+        ids.push(prev_id);
+    }
+
+    // Parse newline-separated names
+    let names_str = std::str::from_utf8(names_bytes).unwrap();
+    let names: Vec<&str> = names_str.split('\n').collect();
+
+    // Combine into pairs
+    ids.into_iter()
+        .zip(names.into_iter())
+        .map(|(id, name)| (id, name.to_string()))
+        .collect()
+}
+
+fn compute_u8_deltas(values: &[u64]) -> Vec<u8> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    let mut deltas = Vec::with_capacity(values.len());
+    deltas.push(0u8);
+    for i in 1..values.len() {
+        let delta = values[i] - values[i - 1];
+        deltas.push(delta as u8);
+    }
+    deltas
+}
+
+fn compute_i16_deltas(values: &[i64]) -> Vec<i16> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    let mut deltas = Vec::with_capacity(values.len());
+    deltas.push(0i16);
+    for i in 1..values.len() {
+        let delta = values[i] - values[i - 1];
+        deltas.push(delta as i16);
+    }
+    deltas
+}
+
+fn restore_u64_from_deltas(first: u64, deltas: &[u8]) -> Vec<u64> {
+    if deltas.is_empty() {
+        return Vec::new();
+    }
+    let mut values = Vec::with_capacity(deltas.len());
+    values.push(first);
+    for i in 1..deltas.len() {
+        values.push(values[i - 1] + deltas[i] as u64);
+    }
+    values
+}
+
+fn restore_i64_from_deltas(first: i64, deltas: &[i16]) -> Vec<i64> {
+    if deltas.is_empty() {
+        return Vec::new();
+    }
+    let mut values = Vec::with_capacity(deltas.len());
+    values.push(first);
+    for i in 1..deltas.len() {
+        values.push(values[i - 1] + deltas[i] as i64);
+    }
+    values
+}
+
+/// Build dictionary encoding for event types
+fn build_event_type_dict(event_types: &[&str]) -> (Vec<u8>, Vec<u8>, HashMap<String, u8>) {
+    // Collect unique event types and sort for deterministic ordering
+    let mut unique_types: Vec<String> = event_types
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    unique_types.sort();
+
+    // Build dictionary: newline-separated strings
+    let dict_str = unique_types.join("\n");
+    let dict_bytes = dict_str.into_bytes();
+
+    // Build string -> index mapping
+    let str_to_idx: HashMap<String, u8> = unique_types
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.clone(), i as u8))
+        .collect();
+
+    // Encode each event type as its index
+    let indices: Vec<u8> = event_types
+        .iter()
+        .map(|s| str_to_idx[*s])
+        .collect();
+
+    (dict_bytes, indices, str_to_idx)
+}
+
+/// Returns (base_info, mapping_ids, mapping_names, columns) where base_info is (first_event_id, first_timestamp, num_events, num_mapping_entries, num_event_types)
+fn encode_events(events: &[(EventKey, EventValue)]) -> Result<((u64, i64, u32, u32, u8), Vec<u8>, Vec<u8>, EncodedColumns), Box<dyn Error>> {
+    // Build mapping table first (binary format: ID deltas + names)
+    let (mapping_ids, mapping_names, pair_to_idx) = build_mapping_table(events);
+    let num_mapping_entries = pair_to_idx.len();
+
+    // Sort by event_id for optimal delta encoding
+    let mut sorted_indices: Vec<usize> = (0..events.len()).collect();
+    sorted_indices.sort_by_key(|&i| events[i].0.id.parse::<u64>().unwrap_or(0));
+
+    // Collect values in sorted order
+    let event_types: Vec<&str> = sorted_indices
+        .iter()
+        .map(|&i| events[i].0.event_type.as_str())
+        .collect();
+    let event_ids: Vec<u64> = sorted_indices
+        .iter()
+        .map(|&i| events[i].0.id.parse::<u64>().unwrap_or(0))
+        .collect();
+    let repo_pair_indices: Vec<u32> = sorted_indices
+        .iter()
+        .map(|&i| {
+            let repo_id = events[i].1.repo.id as u32;
+            let repo_name = events[i].1.repo.name.clone();
+            pair_to_idx[&(repo_id, repo_name)]
+        })
+        .collect();
+    let timestamps: Vec<i64> = sorted_indices
+        .iter()
+        .map(|&i| parse_timestamp(&events[i].1.created_at))
+        .collect();
+
+    // Build event type dictionary
+    let (event_type_dict, event_type_indices, _) = build_event_type_dict(&event_types);
+    let num_event_types = event_type_dict.split(|&b| b == b'\n').count() as u8;
+
+    // Delta encode
+    let event_id_deltas = compute_u8_deltas(&event_ids);
+    let created_at_deltas = compute_i16_deltas(&timestamps);
+
+    let columns = EncodedColumns {
+        event_type_dict,
+        event_type_packed: pack_nibbles(&event_type_indices),
+        event_id_deltas,
+        repo_pair_indices,
+        created_at_deltas,
+    };
+
+    // Return base header info (compressed sizes filled in later)
+    let base_info = (
+        event_ids[0],           // first_event_id
+        timestamps[0],          // first_timestamp
+        events.len() as u32,    // num_events
+        num_mapping_entries as u32, // num_mapping_entries
+        num_event_types,
+    );
+
+    Ok((base_info, mapping_ids, mapping_names, columns))
+}
+
+/// Decode events from raw column data
+fn decode_columns(
+    header: &Header,
+    mapping: &[(u32, String)],
+    event_type_dict: &[String],
+    event_type_indices: &[u8],
+    event_id_deltas: &[u8],
+    repo_pair_indices: &[u32],
+    created_at_deltas: &[i16],
+) -> Vec<(EventKey, EventValue)> {
+    // Restore values from deltas
+    let event_ids = restore_u64_from_deltas(header.first_event_id, event_id_deltas);
+    let timestamps = restore_i64_from_deltas(header.first_timestamp, created_at_deltas);
+
+    (0..header.num_events as usize)
+        .map(|i| {
+            let event_type_idx = event_type_indices[i] as usize;
+            let event_type = event_type_dict[event_type_idx].clone();
+
+            let event_id = event_ids[i];
+
+            // Look up repo info from mapping table
+            let pair_idx = repo_pair_indices[i] as usize;
+            let (repo_id, repo_name) = &mapping[pair_idx];
+
+            let timestamp = timestamps[i];
+            let repo_url = format!("https://api.github.com/repos/{repo_name}");
+
+            (
+                EventKey {
+                    id: event_id.to_string(),
+                    event_type,
+                },
+                EventValue {
+                    repo: Repo {
+                        id: *repo_id as u64,
+                        name: repo_name.clone(),
+                        url: repo_url,
+                    },
+                    created_at: format_timestamp(timestamp),
+                },
+            )
+        })
+        .collect()
+}
+
+impl EventCodec for NatebrennandCodec {
+    fn name(&self) -> &str {
+        "natebrennand"
+    }
+
+    fn encode(&self, events: &[(EventKey, EventValue)]) -> Result<Bytes, Box<dyn Error>> {
+        let (base_info, mapping_ids, mapping_names, columns) = encode_events(events)?;
+        let (first_event_id, first_timestamp, num_events, num_mapping_entries, num_event_types) = base_info;
+
+        // Convert columns to bytes
+        let repo_bytes: Vec<u8> = pack_u24(&columns.repo_pair_indices);  // 24-bit packing
+        let ts_bytes: Vec<u8> = encode_varint_i16(&columns.created_at_deltas);  // varint encoding
+
+        if debug_enabled() {
+            experiment_timestamp_encoding(&columns.created_at_deltas);
+            experiment_repo_bit_packing(&columns.repo_pair_indices);
+        }
+
+        // Compress each column separately (mapping split into IDs and names)
+        let mapping_ids_compressed = zstd::encode_all(mapping_ids.as_slice(), ZSTD_LEVEL)?;
+        let mapping_names_compressed = zstd::encode_all(mapping_names.as_slice(), ZSTD_LEVEL)?;
+        let dict_compressed = zstd::encode_all(columns.event_type_dict.as_slice(), ZSTD_LEVEL)?;
+        let packed_compressed = zstd::encode_all(columns.event_type_packed.as_slice(), ZSTD_LEVEL)?;
+        let id_deltas_compressed = zstd::encode_all(columns.event_id_deltas.as_slice(), ZSTD_LEVEL)?;
+        let repo_compressed = zstd::encode_all(repo_bytes.as_slice(), ZSTD_LEVEL)?;
+        let ts_compressed = zstd::encode_all(ts_bytes.as_slice(), ZSTD_LEVEL)?;
+
+        // Build header with compressed sizes
+        let header = Header {
+            first_event_id,
+            first_timestamp,
+            num_events,
+            num_mapping_entries,
+            event_type_dict_size: columns.event_type_dict.len() as u16,
+            num_event_types,
+            mapping_ids_compressed: mapping_ids_compressed.len() as u32,
+            mapping_names_compressed: mapping_names_compressed.len() as u32,
+            dict_compressed: dict_compressed.len() as u32,
+            packed_compressed: packed_compressed.len() as u32,
+            id_deltas_compressed: id_deltas_compressed.len() as u32,
+            repo_compressed: repo_compressed.len() as u32,
+            ts_compressed: ts_compressed.len() as u32,
+        };
+
+        if debug_enabled() {
+            eprintln!("\n=== Header ({HEADER_SIZE} bytes) ===");
+            eprintln!("  first_event_id:       {}", header.first_event_id);
+            eprintln!("  first_timestamp:      {} ({})", header.first_timestamp, format_timestamp(header.first_timestamp));
+            eprintln!("  num_mapping_entries:  {}", header.num_mapping_entries);
+            eprintln!("  num_events:           {}", header.num_events);
+            eprintln!("  event_type_dict_size: {}", header.event_type_dict_size);
+            eprintln!("  num_event_types:      {}", header.num_event_types);
+            eprintln!("  mapping_ids_compressed:   {}", header.mapping_ids_compressed);
+            eprintln!("  mapping_names_compressed: {}", header.mapping_names_compressed);
+        }
+
+        // Final output: header + compressed columns (concatenated)
+        let total_compressed = mapping_ids_compressed.len()
+            + mapping_names_compressed.len()
+            + dict_compressed.len()
+            + packed_compressed.len()
+            + id_deltas_compressed.len()
+            + repo_compressed.len()
+            + ts_compressed.len();
+
+        let mut buf = Vec::with_capacity(HEADER_SIZE + total_compressed);
+        buf.extend_from_slice(&header.encode());
+        buf.extend_from_slice(&mapping_ids_compressed);
+        buf.extend_from_slice(&mapping_names_compressed);
+        buf.extend_from_slice(&dict_compressed);
+        buf.extend_from_slice(&packed_compressed);
+        buf.extend_from_slice(&id_deltas_compressed);
+        buf.extend_from_slice(&repo_compressed);
+        buf.extend_from_slice(&ts_compressed);
+
+        if debug_enabled() {
+            let payload_size = mapping_ids.len()
+                + mapping_names.len()
+                + columns.event_type_dict.len()
+                + columns.event_type_packed.len()
+                + columns.event_id_deltas.len()
+                + repo_bytes.len()
+                + ts_bytes.len();
+            eprintln!("Uncompressed payload: {payload_size} bytes");
+            eprintln!("Compressed size (per-column zstd {}): {} bytes", ZSTD_LEVEL, buf.len());
+            eprintln!("Compressed bytes/row: {:.2}", buf.len() as f64 / events.len() as f64);
+        }
+
+        Ok(Bytes::from(buf))
+    }
+
+    fn decode(&self, bytes: &[u8]) -> Result<Vec<(EventKey, EventValue)>, Box<dyn Error>> {
+        let header = Header::decode(&bytes[0..HEADER_SIZE]);
+
+        // Decompress each column separately using sizes from header
+        let mut offset = HEADER_SIZE;
+
+        // 1. Mapping IDs (varint delta-encoded)
+        let mapping_ids_compressed = &bytes[offset..offset + header.mapping_ids_compressed as usize];
+        offset += header.mapping_ids_compressed as usize;
+        let mapping_ids_bytes = zstd::decode_all(mapping_ids_compressed)?;
+
+        // 2. Mapping names (newline-separated)
+        let mapping_names_compressed = &bytes[offset..offset + header.mapping_names_compressed as usize];
+        offset += header.mapping_names_compressed as usize;
+        let mapping_names_bytes = zstd::decode_all(mapping_names_compressed)?;
+
+        // Parse binary mapping table
+        let mapping = parse_mapping_table(
+            &mapping_ids_bytes,
+            &mapping_names_bytes,
+            header.num_mapping_entries as usize,
+        );
+
+        // 3. Event type dictionary
+        let dict_compressed = &bytes[offset..offset + header.dict_compressed as usize];
+        offset += header.dict_compressed as usize;
+        let dict_bytes = zstd::decode_all(dict_compressed)?;
+        let event_type_dict: Vec<String> = std::str::from_utf8(&dict_bytes)?
+            .split('\n')
+            .map(|s| s.to_string())
+            .collect();
+
+        // 4. Event type indices (4-bit packed)
+        let packed_compressed = &bytes[offset..offset + header.packed_compressed as usize];
+        offset += header.packed_compressed as usize;
+        let packed_bytes = zstd::decode_all(packed_compressed)?;
+        let num_events = header.num_events as usize;
+        let event_type_indices = unpack_nibbles(&packed_bytes, num_events);
+
+        // 5. Event ID deltas
+        let id_deltas_compressed = &bytes[offset..offset + header.id_deltas_compressed as usize];
+        offset += header.id_deltas_compressed as usize;
+        let event_id_deltas = zstd::decode_all(id_deltas_compressed)?;
+
+        // 6. Repo pair indices (24-bit packed)
+        let repo_compressed = &bytes[offset..offset + header.repo_compressed as usize];
+        offset += header.repo_compressed as usize;
+        let repo_bytes = zstd::decode_all(repo_compressed)?;
+        let repo_pair_indices = unpack_u24(&repo_bytes, num_events);
+
+        // 7. Created at deltas (varint encoded)
+        let ts_compressed = &bytes[offset..offset + header.ts_compressed as usize];
+        let ts_bytes = zstd::decode_all(ts_compressed)?;
+        let created_at_deltas = decode_varint_i16(&ts_bytes, num_events);
+
+        // Decode events
+        let mut events = decode_columns(
+            &header,
+            &mapping,
+            &event_type_dict,
+            &event_type_indices,
+            &event_id_deltas,
+            &repo_pair_indices,
+            &created_at_deltas,
+        );
+
+        // Sort by EventKey to match expected output
+        events.sort_by(|a, b| a.0.cmp(&b.0));
+
+        Ok(events)
+    }
+}
+
+// ============================================================================
+// Debug and analysis functions (enabled with NATE_DEBUG=1)
+// ============================================================================
+
+/// Compress with custom zstd parameters
+fn compress_with_params(data: &[u8], level: i32, window_log: Option<u32>, pledged_size: bool, checksum: bool) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = zstd::Encoder::new(Vec::new(), level).unwrap();
+
+    if let Some(wl) = window_log {
+        encoder.set_parameter(zstd::zstd_safe::CParameter::WindowLog(wl)).ok();
+    }
+    if pledged_size {
+        encoder.set_pledged_src_size(Some(data.len() as u64)).ok();
+    }
+    encoder.include_checksum(checksum).ok();
+
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
 }
 
 /// Pack u32 values into bit-packed bytes (variable bits per value) - for experiments
@@ -521,13 +1135,6 @@ fn experiment_compression_strategies(
     }
 }
 
-pub struct NatebrennandCodec;
-
-impl NatebrennandCodec {
-    pub fn new() -> Self {
-        Self
-    }
-}
 
 fn debug_enabled() -> bool {
     std::env::var("NATE_DEBUG").is_ok()
@@ -1141,604 +1748,4 @@ fn print_column_stats(columns: &EncodedColumns, mapping_tsv: &[u8], mapping_comp
     // FST vs TSV analysis
     analyze_fst_vs_tsv(mapping_tsv, num_rows, &columns.repo_pair_indices);
     eprintln!();
-}
-
-fn parse_timestamp(ts: &str) -> i64 {
-    DateTime::parse_from_rfc3339(ts)
-        .map(|dt| dt.timestamp())
-        .unwrap_or(0)
-}
-
-fn format_timestamp(ts: i64) -> String {
-    chrono::DateTime::from_timestamp(ts, 0)
-        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
-        .unwrap_or_default()
-}
-
-/// Header for per-column compressed format
-/// Base fields (28 bytes):
-///   - first_event_id: u64
-///   - first_timestamp: i64
-///   - num_events: u32
-///   - num_mapping_entries: u32 (number of repo entries)
-///   - event_type_dict_size: u16 (uncompressed)
-///   - num_event_types: u8
-///   - _padding: u8
-/// Compressed sizes (28 bytes):
-///   - mapping_ids_compressed: u32
-///   - mapping_names_compressed: u32
-///   - dict_compressed: u32
-///   - packed_compressed: u32
-///   - id_deltas_compressed: u32
-///   - repo_compressed: u32
-///   - ts_compressed: u32
-struct Header {
-    first_event_id: u64,
-    first_timestamp: i64,
-    num_events: u32,
-    num_mapping_entries: u32,
-    event_type_dict_size: u16,
-    num_event_types: u8,
-    // Compressed sizes for each column
-    mapping_ids_compressed: u32,
-    mapping_names_compressed: u32,
-    dict_compressed: u32,
-    packed_compressed: u32,
-    id_deltas_compressed: u32,
-    repo_compressed: u32,
-    ts_compressed: u32,
-}
-
-const HEADER_SIZE: usize = 56; // 8 + 8 + 4 + 4 + 2 + 1 + 1 + (7 * 4)
-
-impl Header {
-    fn encode(&self) -> [u8; HEADER_SIZE] {
-        let mut buf = [0u8; HEADER_SIZE];
-        let mut pos = 0;
-
-        buf[pos..pos+8].copy_from_slice(&self.first_event_id.to_le_bytes());
-        pos += 8;
-        buf[pos..pos+8].copy_from_slice(&self.first_timestamp.to_le_bytes());
-        pos += 8;
-        buf[pos..pos+4].copy_from_slice(&self.num_events.to_le_bytes());
-        pos += 4;
-        buf[pos..pos+4].copy_from_slice(&self.num_mapping_entries.to_le_bytes());
-        pos += 4;
-        buf[pos..pos+2].copy_from_slice(&self.event_type_dict_size.to_le_bytes());
-        pos += 2;
-        buf[pos] = self.num_event_types;
-        pos += 1;
-        // padding byte
-        pos += 1;
-
-        // Compressed sizes
-        buf[pos..pos+4].copy_from_slice(&self.mapping_ids_compressed.to_le_bytes());
-        pos += 4;
-        buf[pos..pos+4].copy_from_slice(&self.mapping_names_compressed.to_le_bytes());
-        pos += 4;
-        buf[pos..pos+4].copy_from_slice(&self.dict_compressed.to_le_bytes());
-        pos += 4;
-        buf[pos..pos+4].copy_from_slice(&self.packed_compressed.to_le_bytes());
-        pos += 4;
-        buf[pos..pos+4].copy_from_slice(&self.id_deltas_compressed.to_le_bytes());
-        pos += 4;
-        buf[pos..pos+4].copy_from_slice(&self.repo_compressed.to_le_bytes());
-        pos += 4;
-        buf[pos..pos+4].copy_from_slice(&self.ts_compressed.to_le_bytes());
-
-        buf
-    }
-
-    fn decode(bytes: &[u8]) -> Self {
-        let mut pos = 0;
-
-        let first_event_id = u64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap());
-        pos += 8;
-        let first_timestamp = i64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap());
-        pos += 8;
-        let num_events = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
-        pos += 4;
-        let num_mapping_entries = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
-        pos += 4;
-        let event_type_dict_size = u16::from_le_bytes(bytes[pos..pos+2].try_into().unwrap());
-        pos += 2;
-        let num_event_types = bytes[pos];
-        pos += 2; // skip num_event_types + padding
-
-        let mapping_ids_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
-        pos += 4;
-        let mapping_names_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
-        pos += 4;
-        let dict_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
-        pos += 4;
-        let packed_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
-        pos += 4;
-        let id_deltas_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
-        pos += 4;
-        let repo_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
-        pos += 4;
-        let ts_compressed = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
-
-        Self {
-            first_event_id,
-            first_timestamp,
-            num_events,
-            num_mapping_entries,
-            event_type_dict_size,
-            num_event_types,
-            mapping_ids_compressed,
-            mapping_names_compressed,
-            dict_compressed,
-            packed_compressed,
-            id_deltas_compressed,
-            repo_compressed,
-            ts_compressed,
-        }
-    }
-}
-
-/// Holds the encoded column data before compression
-struct EncodedColumns {
-    event_type_dict: Vec<u8>,       // newline-separated event type strings
-    event_type_packed: Vec<u8>,     // 4-bit packed indices (2 per byte)
-    event_id_deltas: Vec<u8>,       // u8 deltas
-    repo_pair_indices: Vec<u32>,    // u32 indices
-    created_at_deltas: Vec<i16>,    // i16 deltas
-}
-
-/// Pack 4-bit values into bytes (2 values per byte, low nibble first)
-fn pack_nibbles(values: &[u8]) -> Vec<u8> {
-    let mut packed = Vec::with_capacity((values.len() + 1) / 2);
-    for chunk in values.chunks(2) {
-        let byte = chunk[0] | (chunk.get(1).copied().unwrap_or(0) << 4);
-        packed.push(byte);
-    }
-    packed
-}
-
-/// Unpack 4-bit values from bytes
-fn unpack_nibbles(packed: &[u8], count: usize) -> Vec<u8> {
-    let mut values = Vec::with_capacity(count);
-    for &byte in packed {
-        values.push(byte & 0x0F);
-        if values.len() < count {
-            values.push(byte >> 4);
-        }
-        if values.len() >= count {
-            break;
-        }
-    }
-    values
-}
-
-/// Build binary mapping table from events
-/// Returns (id_deltas_varint, names_bytes, pair_to_idx mapping)
-/// Repos are sorted by repo_id for optimal delta encoding of IDs.
-fn build_mapping_table(events: &[(EventKey, EventValue)]) -> (Vec<u8>, Vec<u8>, HashMap<(u32, String), u32>) {
-    // Collect unique (repo_id, repo_name) pairs
-    let mut unique_pairs: Vec<(u32, String)> = events
-        .iter()
-        .map(|(_, v)| (v.repo.id as u32, v.repo.name.clone()))
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
-
-    // Sort by repo_id for optimal delta encoding
-    unique_pairs.sort_by_key(|(id, _)| *id);
-
-    // Build index mapping and collect data
-    let mut pair_to_idx: HashMap<(u32, String), u32> = HashMap::new();
-    let mut names: Vec<&str> = Vec::with_capacity(unique_pairs.len());
-
-    for (idx, (repo_id, repo_name)) in unique_pairs.iter().enumerate() {
-        pair_to_idx.insert((*repo_id, repo_name.clone()), idx as u32);
-        names.push(repo_name);
-    }
-
-    // Delta-encode IDs as varints
-    let mut id_deltas: Vec<u8> = Vec::new();
-    let mut prev_id: u32 = 0;
-    for (repo_id, _) in &unique_pairs {
-        let delta = repo_id - prev_id;
-        // Varint encode
-        let mut val = delta;
-        loop {
-            if val < 128 {
-                id_deltas.push(val as u8);
-                break;
-            }
-            id_deltas.push((val as u8 & 0x7f) | 0x80);
-            val >>= 7;
-        }
-        prev_id = *repo_id;
-    }
-
-    // Names as newline-separated
-    let names_bytes = names.join("\n").into_bytes();
-
-    (id_deltas, names_bytes, pair_to_idx)
-}
-
-/// Parse binary mapping table, returns Vec of (repo_id, repo_name) pairs
-fn parse_mapping_table(id_bytes: &[u8], names_bytes: &[u8], num_entries: usize) -> Vec<(u32, String)> {
-    // Decode varint delta-encoded IDs
-    let mut ids = Vec::with_capacity(num_entries);
-    let mut pos = 0;
-    let mut prev_id: u32 = 0;
-    for _ in 0..num_entries {
-        let mut val: u32 = 0;
-        let mut shift = 0;
-        loop {
-            let b = id_bytes[pos];
-            pos += 1;
-            val |= ((b & 0x7f) as u32) << shift;
-            if b < 128 {
-                break;
-            }
-            shift += 7;
-        }
-        prev_id += val;
-        ids.push(prev_id);
-    }
-
-    // Parse newline-separated names
-    let names_str = std::str::from_utf8(names_bytes).unwrap();
-    let names: Vec<&str> = names_str.split('\n').collect();
-
-    // Combine into pairs
-    ids.into_iter()
-        .zip(names.into_iter())
-        .map(|(id, name)| (id, name.to_string()))
-        .collect()
-}
-
-fn compute_u8_deltas(values: &[u64]) -> Vec<u8> {
-    if values.is_empty() {
-        return Vec::new();
-    }
-    let mut deltas = Vec::with_capacity(values.len());
-    deltas.push(0u8);
-    for i in 1..values.len() {
-        let delta = values[i] - values[i - 1];
-        deltas.push(delta as u8);
-    }
-    deltas
-}
-
-fn compute_i16_deltas(values: &[i64]) -> Vec<i16> {
-    if values.is_empty() {
-        return Vec::new();
-    }
-    let mut deltas = Vec::with_capacity(values.len());
-    deltas.push(0i16);
-    for i in 1..values.len() {
-        let delta = values[i] - values[i - 1];
-        deltas.push(delta as i16);
-    }
-    deltas
-}
-
-fn restore_u64_from_deltas(first: u64, deltas: &[u8]) -> Vec<u64> {
-    if deltas.is_empty() {
-        return Vec::new();
-    }
-    let mut values = Vec::with_capacity(deltas.len());
-    values.push(first);
-    for i in 1..deltas.len() {
-        values.push(values[i - 1] + deltas[i] as u64);
-    }
-    values
-}
-
-fn restore_i64_from_deltas(first: i64, deltas: &[i16]) -> Vec<i64> {
-    if deltas.is_empty() {
-        return Vec::new();
-    }
-    let mut values = Vec::with_capacity(deltas.len());
-    values.push(first);
-    for i in 1..deltas.len() {
-        values.push(values[i - 1] + deltas[i] as i64);
-    }
-    values
-}
-
-/// Build dictionary encoding for event types
-fn build_event_type_dict(event_types: &[&str]) -> (Vec<u8>, Vec<u8>, HashMap<String, u8>) {
-    // Collect unique event types and sort for deterministic ordering
-    let mut unique_types: Vec<String> = event_types
-        .iter()
-        .map(|s| s.to_string())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
-    unique_types.sort();
-
-    // Build dictionary: newline-separated strings
-    let dict_str = unique_types.join("\n");
-    let dict_bytes = dict_str.into_bytes();
-
-    // Build string -> index mapping
-    let str_to_idx: HashMap<String, u8> = unique_types
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.clone(), i as u8))
-        .collect();
-
-    // Encode each event type as its index
-    let indices: Vec<u8> = event_types
-        .iter()
-        .map(|s| str_to_idx[*s])
-        .collect();
-
-    (dict_bytes, indices, str_to_idx)
-}
-
-/// Returns (base_info, mapping_ids, mapping_names, columns) where base_info is (first_event_id, first_timestamp, num_events, num_mapping_entries, num_event_types)
-fn encode_events(events: &[(EventKey, EventValue)]) -> Result<((u64, i64, u32, u32, u8), Vec<u8>, Vec<u8>, EncodedColumns), Box<dyn Error>> {
-    // Build mapping table first (binary format: ID deltas + names)
-    let (mapping_ids, mapping_names, pair_to_idx) = build_mapping_table(events);
-    let num_mapping_entries = pair_to_idx.len();
-
-    // Sort by event_id for optimal delta encoding
-    let mut sorted_indices: Vec<usize> = (0..events.len()).collect();
-    sorted_indices.sort_by_key(|&i| events[i].0.id.parse::<u64>().unwrap_or(0));
-
-    // Collect values in sorted order
-    let event_types: Vec<&str> = sorted_indices
-        .iter()
-        .map(|&i| events[i].0.event_type.as_str())
-        .collect();
-    let event_ids: Vec<u64> = sorted_indices
-        .iter()
-        .map(|&i| events[i].0.id.parse::<u64>().unwrap_or(0))
-        .collect();
-    let repo_pair_indices: Vec<u32> = sorted_indices
-        .iter()
-        .map(|&i| {
-            let repo_id = events[i].1.repo.id as u32;
-            let repo_name = events[i].1.repo.name.clone();
-            pair_to_idx[&(repo_id, repo_name)]
-        })
-        .collect();
-    let timestamps: Vec<i64> = sorted_indices
-        .iter()
-        .map(|&i| parse_timestamp(&events[i].1.created_at))
-        .collect();
-
-    // Build event type dictionary
-    let (event_type_dict, event_type_indices, _) = build_event_type_dict(&event_types);
-    let num_event_types = event_type_dict.split(|&b| b == b'\n').count() as u8;
-
-    // Delta encode
-    let event_id_deltas = compute_u8_deltas(&event_ids);
-    let created_at_deltas = compute_i16_deltas(&timestamps);
-
-    let columns = EncodedColumns {
-        event_type_dict,
-        event_type_packed: pack_nibbles(&event_type_indices),
-        event_id_deltas,
-        repo_pair_indices,
-        created_at_deltas,
-    };
-
-    // Return base header info (compressed sizes filled in later)
-    let base_info = (
-        event_ids[0],           // first_event_id
-        timestamps[0],          // first_timestamp
-        events.len() as u32,    // num_events
-        num_mapping_entries as u32, // num_mapping_entries
-        num_event_types,
-    );
-
-    Ok((base_info, mapping_ids, mapping_names, columns))
-}
-
-/// Decode events from raw column data
-fn decode_columns(
-    header: &Header,
-    mapping: &[(u32, String)],
-    event_type_dict: &[String],
-    event_type_indices: &[u8],
-    event_id_deltas: &[u8],
-    repo_pair_indices: &[u32],
-    created_at_deltas: &[i16],
-) -> Vec<(EventKey, EventValue)> {
-    // Restore values from deltas
-    let event_ids = restore_u64_from_deltas(header.first_event_id, event_id_deltas);
-    let timestamps = restore_i64_from_deltas(header.first_timestamp, created_at_deltas);
-
-    (0..header.num_events as usize)
-        .map(|i| {
-            let event_type_idx = event_type_indices[i] as usize;
-            let event_type = event_type_dict[event_type_idx].clone();
-
-            let event_id = event_ids[i];
-
-            // Look up repo info from mapping table
-            let pair_idx = repo_pair_indices[i] as usize;
-            let (repo_id, repo_name) = &mapping[pair_idx];
-
-            let timestamp = timestamps[i];
-            let repo_url = format!("https://api.github.com/repos/{repo_name}");
-
-            (
-                EventKey {
-                    id: event_id.to_string(),
-                    event_type,
-                },
-                EventValue {
-                    repo: Repo {
-                        id: *repo_id as u64,
-                        name: repo_name.clone(),
-                        url: repo_url,
-                    },
-                    created_at: format_timestamp(timestamp),
-                },
-            )
-        })
-        .collect()
-}
-
-impl EventCodec for NatebrennandCodec {
-    fn name(&self) -> &str {
-        "natebrennand"
-    }
-
-    fn encode(&self, events: &[(EventKey, EventValue)]) -> Result<Bytes, Box<dyn Error>> {
-        let (base_info, mapping_ids, mapping_names, columns) = encode_events(events)?;
-        let (first_event_id, first_timestamp, num_events, num_mapping_entries, num_event_types) = base_info;
-
-        // Convert columns to bytes
-        let repo_bytes: Vec<u8> = pack_u24(&columns.repo_pair_indices);  // 24-bit packing
-        let ts_bytes: Vec<u8> = encode_varint_i16(&columns.created_at_deltas);  // varint encoding
-
-        if debug_enabled() {
-            experiment_timestamp_encoding(&columns.created_at_deltas);
-            experiment_repo_bit_packing(&columns.repo_pair_indices);
-        }
-
-        // Compress each column separately (mapping split into IDs and names)
-        let mapping_ids_compressed = zstd::encode_all(mapping_ids.as_slice(), ZSTD_LEVEL)?;
-        let mapping_names_compressed = zstd::encode_all(mapping_names.as_slice(), ZSTD_LEVEL)?;
-        let dict_compressed = zstd::encode_all(columns.event_type_dict.as_slice(), ZSTD_LEVEL)?;
-        let packed_compressed = zstd::encode_all(columns.event_type_packed.as_slice(), ZSTD_LEVEL)?;
-        let id_deltas_compressed = zstd::encode_all(columns.event_id_deltas.as_slice(), ZSTD_LEVEL)?;
-        let repo_compressed = zstd::encode_all(repo_bytes.as_slice(), ZSTD_LEVEL)?;
-        let ts_compressed = zstd::encode_all(ts_bytes.as_slice(), ZSTD_LEVEL)?;
-
-        // Build header with compressed sizes
-        let header = Header {
-            first_event_id,
-            first_timestamp,
-            num_events,
-            num_mapping_entries,
-            event_type_dict_size: columns.event_type_dict.len() as u16,
-            num_event_types,
-            mapping_ids_compressed: mapping_ids_compressed.len() as u32,
-            mapping_names_compressed: mapping_names_compressed.len() as u32,
-            dict_compressed: dict_compressed.len() as u32,
-            packed_compressed: packed_compressed.len() as u32,
-            id_deltas_compressed: id_deltas_compressed.len() as u32,
-            repo_compressed: repo_compressed.len() as u32,
-            ts_compressed: ts_compressed.len() as u32,
-        };
-
-        if debug_enabled() {
-            eprintln!("\n=== Header ({HEADER_SIZE} bytes) ===");
-            eprintln!("  first_event_id:       {}", header.first_event_id);
-            eprintln!("  first_timestamp:      {} ({})", header.first_timestamp, format_timestamp(header.first_timestamp));
-            eprintln!("  num_mapping_entries:  {}", header.num_mapping_entries);
-            eprintln!("  num_events:           {}", header.num_events);
-            eprintln!("  event_type_dict_size: {}", header.event_type_dict_size);
-            eprintln!("  num_event_types:      {}", header.num_event_types);
-            eprintln!("  mapping_ids_compressed:   {}", header.mapping_ids_compressed);
-            eprintln!("  mapping_names_compressed: {}", header.mapping_names_compressed);
-        }
-
-        // Final output: header + compressed columns (concatenated)
-        let total_compressed = mapping_ids_compressed.len()
-            + mapping_names_compressed.len()
-            + dict_compressed.len()
-            + packed_compressed.len()
-            + id_deltas_compressed.len()
-            + repo_compressed.len()
-            + ts_compressed.len();
-
-        let mut buf = Vec::with_capacity(HEADER_SIZE + total_compressed);
-        buf.extend_from_slice(&header.encode());
-        buf.extend_from_slice(&mapping_ids_compressed);
-        buf.extend_from_slice(&mapping_names_compressed);
-        buf.extend_from_slice(&dict_compressed);
-        buf.extend_from_slice(&packed_compressed);
-        buf.extend_from_slice(&id_deltas_compressed);
-        buf.extend_from_slice(&repo_compressed);
-        buf.extend_from_slice(&ts_compressed);
-
-        if debug_enabled() {
-            let payload_size = mapping_ids.len()
-                + mapping_names.len()
-                + columns.event_type_dict.len()
-                + columns.event_type_packed.len()
-                + columns.event_id_deltas.len()
-                + repo_bytes.len()
-                + ts_bytes.len();
-            eprintln!("Uncompressed payload: {payload_size} bytes");
-            eprintln!("Compressed size (per-column zstd {}): {} bytes", ZSTD_LEVEL, buf.len());
-            eprintln!("Compressed bytes/row: {:.2}", buf.len() as f64 / events.len() as f64);
-        }
-
-        Ok(Bytes::from(buf))
-    }
-
-    fn decode(&self, bytes: &[u8]) -> Result<Vec<(EventKey, EventValue)>, Box<dyn Error>> {
-        let header = Header::decode(&bytes[0..HEADER_SIZE]);
-
-        // Decompress each column separately using sizes from header
-        let mut offset = HEADER_SIZE;
-
-        // 1. Mapping IDs (varint delta-encoded)
-        let mapping_ids_compressed = &bytes[offset..offset + header.mapping_ids_compressed as usize];
-        offset += header.mapping_ids_compressed as usize;
-        let mapping_ids_bytes = zstd::decode_all(mapping_ids_compressed)?;
-
-        // 2. Mapping names (newline-separated)
-        let mapping_names_compressed = &bytes[offset..offset + header.mapping_names_compressed as usize];
-        offset += header.mapping_names_compressed as usize;
-        let mapping_names_bytes = zstd::decode_all(mapping_names_compressed)?;
-
-        // Parse binary mapping table
-        let mapping = parse_mapping_table(
-            &mapping_ids_bytes,
-            &mapping_names_bytes,
-            header.num_mapping_entries as usize,
-        );
-
-        // 3. Event type dictionary
-        let dict_compressed = &bytes[offset..offset + header.dict_compressed as usize];
-        offset += header.dict_compressed as usize;
-        let dict_bytes = zstd::decode_all(dict_compressed)?;
-        let event_type_dict: Vec<String> = std::str::from_utf8(&dict_bytes)?
-            .split('\n')
-            .map(|s| s.to_string())
-            .collect();
-
-        // 4. Event type indices (4-bit packed)
-        let packed_compressed = &bytes[offset..offset + header.packed_compressed as usize];
-        offset += header.packed_compressed as usize;
-        let packed_bytes = zstd::decode_all(packed_compressed)?;
-        let num_events = header.num_events as usize;
-        let event_type_indices = unpack_nibbles(&packed_bytes, num_events);
-
-        // 5. Event ID deltas
-        let id_deltas_compressed = &bytes[offset..offset + header.id_deltas_compressed as usize];
-        offset += header.id_deltas_compressed as usize;
-        let event_id_deltas = zstd::decode_all(id_deltas_compressed)?;
-
-        // 6. Repo pair indices (24-bit packed)
-        let repo_compressed = &bytes[offset..offset + header.repo_compressed as usize];
-        offset += header.repo_compressed as usize;
-        let repo_bytes = zstd::decode_all(repo_compressed)?;
-        let repo_pair_indices = unpack_u24(&repo_bytes, num_events);
-
-        // 7. Created at deltas (varint encoded)
-        let ts_compressed = &bytes[offset..offset + header.ts_compressed as usize];
-        let ts_bytes = zstd::decode_all(ts_compressed)?;
-        let created_at_deltas = decode_varint_i16(&ts_bytes, num_events);
-
-        // Decode events
-        let mut events = decode_columns(
-            &header,
-            &mapping,
-            &event_type_dict,
-            &event_type_indices,
-            &event_id_deltas,
-            &repo_pair_indices,
-            &created_at_deltas,
-        );
-
-        // Sort by EventKey to match expected output
-        events.sort_by(|a, b| a.0.cmp(&b.0));
-
-        Ok(events)
-    }
 }
