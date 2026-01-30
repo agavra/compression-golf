@@ -182,7 +182,10 @@ fn build_docker_codec(name: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn run_docker_encode(image: &str, events: &[(EventKey, EventValue)]) -> Result<Vec<u8>, Box<dyn Error>> {
+fn run_docker_encode(
+    image: &str,
+    events: &[(EventKey, EventValue)],
+) -> Result<Vec<u8>, Box<dyn Error>> {
     use std::io::Write;
 
     let mut child = std::process::Command::new("docker")
@@ -216,7 +219,10 @@ fn run_docker_encode(image: &str, events: &[(EventKey, EventValue)]) -> Result<V
     Ok(output.stdout)
 }
 
-fn run_docker_decode(image: &str, data: &[u8]) -> Result<Vec<(EventKey, EventValue)>, Box<dyn Error>> {
+fn run_docker_decode(
+    image: &str,
+    data: &[u8],
+) -> Result<Vec<(EventKey, EventValue)>, Box<dyn Error>> {
     use std::io::Write;
 
     let mut child = std::process::Command::new("docker")
