@@ -7,6 +7,7 @@ mod agavra;
 mod codec;
 mod hachikuji;
 mod naive;
+mod samsond;
 mod xiangpenghao;
 mod zstd;
 
@@ -14,6 +15,7 @@ use agavra::AgavraCodec;
 use codec::EventCodec;
 use hachikuji::HachikujiCodec;
 use naive::NaiveCodec;
+use samsond::SamsondCodec;
 use xiangpenghao::XiangpengHaoCodec;
 use zstd::ZstdCodec;
 
@@ -182,6 +184,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         (Box::new(AgavraCodec::new()), &sorted_events),
         (Box::new(HachikujiCodec::new()), &sorted_events),
         (Box::new(XiangpengHaoCodec::new()), &sorted_events),
+        (Box::new(SamsondCodec::new()), &events),
     ];
 
     for (codec, expected) in codecs {
