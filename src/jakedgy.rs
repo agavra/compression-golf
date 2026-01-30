@@ -337,7 +337,9 @@ impl TypeDict {
             while bytes[*pos] != 0 {
                 *pos += 1;
             }
-            let t = std::str::from_utf8(&bytes[start..*pos]).unwrap().to_string();
+            let t = std::str::from_utf8(&bytes[start..*pos])
+                .unwrap()
+                .to_string();
             *pos += 1; // skip null terminator
             type_to_idx.insert(t.clone(), i as u8);
             types.push(t);
@@ -407,7 +409,9 @@ impl RepoNameDict {
             while bytes[*pos] != 0 {
                 *pos += 1;
             }
-            let name = std::str::from_utf8(&bytes[start..*pos]).unwrap().to_string();
+            let name = std::str::from_utf8(&bytes[start..*pos])
+                .unwrap()
+                .to_string();
             *pos += 1; // skip null terminator
             name_to_idx.insert(name.clone(), i as u32);
             names.push(name);
