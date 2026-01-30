@@ -5,14 +5,28 @@
 //! - Dictionary encode event_type (14 unique values)
 //! - Store unique (repo_id, repo_name) pairs in a TSV mapping table (compressed once)
 //! - Per event, store only an index into the mapping table
-//! - Store first event_id in header, deltas as UInt8 (max delta is 251)
-//! - Store first timestamp in header, deltas as Int16 (range -2540 to +2540)
+//! - Store first event_id in header, deltas as u8 (max delta is 251)
+//! - Store first timestamp in header, deltas as i16 (range -2540 to +2540)
 //! - Reconstruct repo.url from repo.name during decode
 //! - Use zstd level 22 compression
 //!
 //! Binary format:
-//! - Header (28 bytes, uncompressed)
-//! - Compressed payload: mapping TSV + event_type dict + columns
+//!   Header (28 bytes, uncompressed):
+//!     - first_event_id: u64
+//!     - first_timestamp: i64
+//!     - mapping_size: u32
+//!     - num_events: u32
+//!     - event_type_dict_size: u16
+//!     - num_event_types: u8
+//!     - _padding: u8
+//!
+//!   Compressed payload (zstd-22):
+//!     - mapping TSV (repo_id\trepo_name\n)
+//!     - event_type dict (newline-separated strings)
+//!     - event_type indices: [u8; num_events]
+//!     - event_id deltas: [u8; num_events]
+//!     - repo_pair indices: [u32-le; num_events]
+//!     - created_at deltas: [i16-le; num_events]
 //!
 //! Set NATE_DEBUG=1 to see column size statistics.
 
