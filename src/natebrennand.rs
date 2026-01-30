@@ -70,6 +70,10 @@
 //!   - Frequency-ordered event_type indices: Reordering dictionary so most common
 //!     types (PushEvent=68.9%) get index 0 instead of 12. Result: +4 bytes worse.
 //!     zstd already handles the patterns efficiently with alphabetical ordering.
+//!   - Owner/repo name splitting: Separate owner ("microsoft") from repo ("vscode")
+//!     into two dictionaries, store (owner_idx, suffix_idx) per entry. Result: +350KB
+//!     worse. 87.6% of owners have only 1 repo, so there's almost no sharing benefit.
+//!     The overhead of separate dictionaries outweighs any gains.
 //!   - Frequency-ordered repo indices: Reordering repos by frequency (most common
 //!     first) improved index compression by 60KB (more values fit in smaller bytes),
 //!     but hurt TSV compression by 90KB (lost alphabetical prefix sharing). Net loss.
