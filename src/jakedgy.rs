@@ -448,7 +448,7 @@ impl RepoIdDict {
             let name_idx = name_dict.get_index(&value.repo.name);
             id_to_names
                 .entry(value.repo.id)
-                .or_default()
+                .or_insert_with(std::collections::HashSet::new)
                 .insert(name_idx);
         }
 
@@ -601,7 +601,7 @@ impl EventCodec for JakedgyCodec {
         id_dict.encode(&mut header);
 
         // Calculate row groups
-        let num_groups = events.len().div_ceil(ROW_GROUP_SIZE);
+        let num_groups = (events.len() + ROW_GROUP_SIZE - 1) / ROW_GROUP_SIZE;
         encode_varint(&mut header, num_groups as u64);
 
         // Compress header
@@ -815,7 +815,7 @@ impl EventCodec for JakedgyCodec {
                 let repo_id = id_dict.get_repo_id(repo_idx);
                 let name_idx = id_dict.get_name_idx(repo_idx, variant_idx);
                 let repo_name = name_dict.get_name(name_idx).to_string();
-                let repo_url = format!("https://api.github.com/repos/{repo_name}");
+                let repo_url = format!("https://api.github.com/repos/{}", repo_name);
 
                 events.push((
                     EventKey {

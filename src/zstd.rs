@@ -19,7 +19,7 @@ impl ZstdCodec {
     pub fn new(level: i32) -> Self {
         Self {
             level,
-            name: format!("Zstd({level})"),
+            name: format!("Zstd({})", level),
         }
     }
 }

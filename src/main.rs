@@ -25,8 +25,6 @@ use natebrennand::NatebrennandCodec;
 use xiangpenghao::XiangpengHaoCodec;
 use zstd::ZstdCodec;
 
-type CodecWithEvents<'a> = Vec<(Box<dyn EventCodec>, &'a [(EventKey, EventValue)])>;
-
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EventKey {
     pub id: String,
@@ -100,7 +98,7 @@ fn print_row(name: &str, size: usize, baseline: usize) {
     };
 
     let improvement_str = if improvement > 0.0 {
-        format!("-{improvement:.1}%")
+        format!("-{:.1}%", improvement)
     } else if improvement < 0.0 {
         format!("+{:.1}%", -improvement)
     } else {
@@ -185,7 +183,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let naive = NaiveCodec::new();
     let baseline = naive.encode(&events)?.len();
 
-    let codecs: CodecWithEvents = vec![
+    let codecs: Vec<(Box<dyn EventCodec>, &[(EventKey, EventValue)])> = vec![
         (Box::new(NaiveCodec::new()), &events),
         (Box::new(ZstdCodec::new(9)), &events),
         // (Box::new(ZstdCodec::new(22)), &events), // commented out b/c it takes long to run
