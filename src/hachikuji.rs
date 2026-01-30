@@ -301,7 +301,7 @@ impl ArithmeticEncoder {
     fn encode_symbol(&mut self, cum_freq: u64, freq: u64, total: u64) {
         let range = self.high - self.low + 1;
         self.high = self.low + (range * (cum_freq + freq) / total) - 1;
-        self.low = self.low + (range * cum_freq / total);
+        self.low += range * cum_freq / total;
 
         loop {
             if self.high < 0x8000_0000 {
@@ -395,7 +395,7 @@ impl<'a> ArithmeticDecoder<'a> {
 
         // Update state
         self.high = self.low + (range * cum_freqs[symbol + 1] / total) - 1;
-        self.low = self.low + (range * cum_freqs[symbol] / total);
+        self.low += range * cum_freqs[symbol] / total;
 
         loop {
             if self.high < 0x8000_0000 {
@@ -515,7 +515,7 @@ fn encode_ts_deltas(values: &[i64], buf: &mut Vec<u8>) {
                 0
             } else if val == 1 {
                 1
-            } else if val >= 2 && val <= 127 {
+            } else if (2..=127).contains(&val) {
                 exceptions.push(val);
                 2
             } else {
@@ -692,7 +692,7 @@ impl EventCodec for HachikujiCodec {
 
             let (repo_id, name_idx) = repo_dict.get_tuple(repo_idxs[i] as u32);
             let repo_name = name_dict.get_string(name_idx).to_string();
-            let repo_url = format!("https://api.github.com/repos/{}", repo_name);
+            let repo_url = format!("https://api.github.com/repos/{repo_name}");
 
             let id = (prev_id as i64 + id_deltas[i]) as u64;
             prev_id = id;

@@ -626,8 +626,8 @@ impl EventCodec for AgavraCodec {
             let (user_idx, repo_idx, repo_id) = tuple_dict.get_tuple(tuple_idx);
             let user = user_dict.get_string(user_idx);
             let repo = repo_dict.get_string(repo_idx);
-            let repo_name = format!("{}/{}", user, repo);
-            let repo_url = format!("https://api.github.com/repos/{}", repo_name);
+            let repo_name = format!("{user}/{repo}");
+            let repo_url = format!("https://api.github.com/repos/{repo_name}");
 
             let ts = (prev_ts as i64 + deltas[2]) as u64;
             prev_ts = ts;

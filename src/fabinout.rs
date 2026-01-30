@@ -262,7 +262,7 @@ impl EventCodec for FabinoutCodec {
             let created_at = dates[date_idx].clone();
 
             // Reconstruct URL from repo name
-            let repo_url = format!("https://api.github.com/repos/{}", repo_name);
+            let repo_url = format!("https://api.github.com/repos/{repo_name}");
 
             let key = EventKey {
                 id: id.to_string(),

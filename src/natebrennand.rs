@@ -84,9 +84,9 @@
 //!     - Per event, stored u32 trie index from lookup()
 //!     - Result: 8,460,472 bytes (8.46 B/row)
 //!     - Switched to TSV mapping: 6,733,425 bytes (6.73 B/row) - 20% improvement
-//!     Conclusion: TSV + zstd beats trie because zstd already exploits alphabetical
-//!     prefix sharing in sorted TSV entries. The trie's space-efficient structure
-//!     doesn't help when the whole thing gets zstd-compressed anyway.
+//!       Conclusion: TSV + zstd beats trie because zstd already exploits alphabetical
+//!       prefix sharing in sorted TSV entries. The trie's space-efficient structure
+//!       doesn't help when the whole thing gets zstd-compressed anyway.
 //!
 //! Current results (1M events):
 //!   - event_type:       0.22 B/row (4-bit packed)
@@ -135,8 +135,7 @@ fn print_value_stats_unsigned(name: &str, values: &[u64]) {
     let fits_32 = values.iter().filter(|&&v| v <= u32::MAX as u64).count() as f64 / count * 100.0;
 
     eprintln!(
-        "  {:<18} min={:<12} max={:<12} u8={:>5.1}% u16={:>5.1}% u32={:>5.1}%",
-        name, min, max, fits_8, fits_16, fits_32
+        "  {name:<18} min={min:<12} max={max:<12} u8={fits_8:>5.1}% u16={fits_16:>5.1}% u32={fits_32:>5.1}%"
     );
 }
 
@@ -153,8 +152,7 @@ fn print_value_stats_signed(name: &str, values: &[i64]) {
     let fits_32 = values.iter().filter(|&&v| v >= i32::MIN as i64 && v <= i32::MAX as i64).count() as f64 / count * 100.0;
 
     eprintln!(
-        "  {:<18} min={:<12} max={:<12} i8={:>5.1}% i16={:>5.1}% i32={:>5.1}%",
-        name, min, max, fits_8, fits_16, fits_32
+        "  {name:<18} min={min:<12} max={max:<12} i8={fits_8:>5.1}% i16={fits_16:>5.1}% i32={fits_32:>5.1}%"
     );
 }
 
@@ -205,13 +203,13 @@ fn print_event_type_distribution(dict: &[u8], indices: &[u8]) {
     let avg_run = indices.len() as f64 / num_runs as f64;
     let max_run = *runs.iter().max().unwrap_or(&0);
     let runs_of_1 = runs.iter().filter(|&&r| r == 1).count();
-    let runs_of_2_5 = runs.iter().filter(|&&r| r >= 2 && r <= 5).count();
+    let runs_of_2_5 = runs.iter().filter(|&&r| (2..=5).contains(&r)).count();
     let runs_of_6_plus = runs.iter().filter(|&&r| r >= 6).count();
 
     eprintln!("\n=== Run-Length Analysis (event_type) ===");
-    eprintln!("  Total runs:    {:>10}", num_runs);
-    eprintln!("  Avg run len:   {:>10.2}", avg_run);
-    eprintln!("  Max run len:   {:>10}", max_run);
+    eprintln!("  Total runs:    {num_runs:>10}");
+    eprintln!("  Avg run len:   {avg_run:>10.2}");
+    eprintln!("  Max run len:   {max_run:>10}");
     eprintln!("  Runs of 1:     {:>10} ({:.1}%)", runs_of_1, runs_of_1 as f64 / num_runs as f64 * 100.0);
     eprintln!("  Runs of 2-5:   {:>10} ({:.1}%)", runs_of_2_5, runs_of_2_5 as f64 / num_runs as f64 * 100.0);
     eprintln!("  Runs of 6+:    {:>10} ({:.1}%)", runs_of_6_plus, runs_of_6_plus as f64 / num_runs as f64 * 100.0);
@@ -248,7 +246,7 @@ fn print_event_type_distribution(dict: &[u8], indices: &[u8]) {
     let huffman_bytes = huffman_bits / 8.0;
 
     eprintln!("\n=== Entropy Analysis (event_type) ===");
-    eprintln!("  Shannon entropy: {:.3} bits/symbol", entropy);
+    eprintln!("  Shannon entropy: {entropy:.3} bits/symbol");
     eprintln!("  Theoretical min: {:>10.0} bytes ({:.2} B/row)", entropy_bytes, entropy_bytes / total);
     eprintln!("  Huffman estimate:{:>10.0} bytes ({:.2} B/row)", huffman_bytes, huffman_bytes / total);
     eprintln!("  4-bit packing:   {:>10} bytes ({:.2} B/row)", (indices.len() + 1) / 2, 0.5);
@@ -315,9 +313,9 @@ fn print_repo_pair_idx_analysis(indices: &[u32]) {
     let runs_of_1 = runs.iter().filter(|&&r| r == 1).count();
 
     eprintln!("\n=== Run-Length Analysis (repo_pair_idx) ===");
-    eprintln!("  Total runs:    {:>10}", num_runs);
-    eprintln!("  Avg run len:   {:>10.2}", avg_run);
-    eprintln!("  Max run len:   {:>10}", max_run);
+    eprintln!("  Total runs:    {num_runs:>10}");
+    eprintln!("  Avg run len:   {avg_run:>10.2}");
+    eprintln!("  Max run len:   {max_run:>10}");
     eprintln!("  Runs of 1:     {:>10} ({:.1}%)", runs_of_1, runs_of_1 as f64 / num_runs as f64 * 100.0);
 
     // Delta analysis (consecutive differences)
@@ -329,19 +327,19 @@ fn print_repo_pair_idx_analysis(indices: &[u32]) {
         let delta_min = *deltas.iter().min().unwrap();
         let delta_max = *deltas.iter().max().unwrap();
         let zeros = deltas.iter().filter(|&&d| d == 0).count();
-        let fits_i8 = deltas.iter().filter(|&&d| d >= -128 && d <= 127).count();
-        let fits_i16 = deltas.iter().filter(|&&d| d >= -32768 && d <= 32767).count();
+        let fits_i8 = deltas.iter().filter(|&&d| (-128..=127).contains(&d)).count();
+        let fits_i16 = deltas.iter().filter(|&&d| (-32768..=32767).contains(&d)).count();
 
         eprintln!("\n=== Delta Analysis (repo_pair_idx) ===");
-        eprintln!("  Delta range:   {} to {}", delta_min, delta_max);
+        eprintln!("  Delta range:   {delta_min} to {delta_max}");
         eprintln!("  Zero deltas:   {:>10} ({:.1}%) [same repo]", zeros, zeros as f64 / deltas.len() as f64 * 100.0);
         eprintln!("  Fits in i8:    {:>10} ({:.1}%)", fits_i8, fits_i8 as f64 / deltas.len() as f64 * 100.0);
         eprintln!("  Fits in i16:   {:>10} ({:.1}%)", fits_i16, fits_i16 as f64 / deltas.len() as f64 * 100.0);
 
         // Estimate delta encoding size
         let delta_bytes: usize = deltas.iter().map(|&d| {
-            if d >= -128 && d <= 127 { 1 }
-            else if d >= -32768 && d <= 32767 { 2 }
+            if (-128..=127).contains(&d) { 1 }
+            else if (-32768..=32767).contains(&d) { 2 }
             else { 4 }
         }).sum();
         eprintln!("  Delta estimate:{:>10} bytes (vs {} raw u32)", delta_bytes + 4, total * 4);
@@ -401,13 +399,13 @@ fn analyze_fst_vs_tsv(mapping_tsv: &[u8], num_rows: usize, per_event_pair_idx: &
     let tsv_compressed = zstd::encode_all(mapping_tsv, ZSTD_LEVEL).unwrap().len();
 
     eprintln!("\n=== FST vs TSV Analysis ===");
-    eprintln!("  Num (id,name) pairs:{:>8}", num_repos);
+    eprintln!("  Num (id,name) pairs:{num_repos:>8}");
     eprintln!("  Unique names:     {:>10} ({} duplicates)", num_unique_names, num_repos - num_unique_names);
     eprintln!("  TSV raw:          {:>10} bytes", mapping_tsv.len());
     eprintln!("  TSV + zstd:       {:>10} bytes ({:.2} B/row)", tsv_compressed, tsv_compressed as f64 / num_rows as f64);
     eprintln!("  FST raw:          {:>10} bytes", fst_bytes.len());
     eprintln!("  FST + zstd:       {:>10} bytes ({:.2} B/row)", fst_compressed, fst_compressed as f64 / num_rows as f64);
-    eprintln!("  repo_ids raw:     {:>10} bytes", repo_ids_raw);
+    eprintln!("  repo_ids raw:     {repo_ids_raw:>10} bytes");
     eprintln!("  repo_ids + zstd:  {:>10} bytes ({:.2} B/row)", repo_ids_compressed, repo_ids_compressed as f64 / num_rows as f64);
     eprintln!("  FST + ids total:  {:>10} bytes ({:.2} B/row)",
         fst_compressed + repo_ids_compressed,
@@ -445,13 +443,13 @@ fn analyze_fst_vs_tsv(mapping_tsv: &[u8], num_rows: usize, per_event_pair_idx: &
         ids_with_one_name, ids_with_one_name as f64 / id_to_names.len() as f64 * 100.0);
     eprintln!("  IDs with 2+ names:  {:>10} ({:.1}%) [renamed repos]",
         ids_with_multi_names, ids_with_multi_names as f64 / id_to_names.len() as f64 * 100.0);
-    eprintln!("  Max names per ID:   {:>10}", max_names_per_id);
+    eprintln!("  Max names per ID:   {max_names_per_id:>10}");
 
     // Show a few examples of renamed repos
     if ids_with_multi_names > 0 {
         eprintln!("  Examples of renamed repos:");
         for (id, names) in id_to_names.iter().filter(|(_, v)| v.len() > 1).take(3) {
-            eprintln!("    ID {}: {:?}", id, names);
+            eprintln!("    ID {id}: {names:?}");
         }
     }
 
@@ -497,18 +495,18 @@ fn analyze_fst_vs_tsv(mapping_tsv: &[u8], num_rows: usize, per_event_pair_idx: &
     // weight by frequency. But this gives us a sense of the disambiguation needed.
 
     eprintln!("\n=== Proposed FST + repo_id Format ===");
-    eprintln!("  (id,name) pairs using primary:    {:>8}", events_with_primary);
+    eprintln!("  (id,name) pairs using primary:    {events_with_primary:>8}");
     eprintln!("  (id,name) pairs using alt names:  {:>8} ({:.2}%)",
         events_with_alt, events_with_alt as f64 / (events_with_primary + events_with_alt) as f64 * 100.0);
 
     // Estimate new format size:
     // - FST (name -> repo_id): 3.61 MB compressed (already calculated)
     // - Per-event repo_id: num_rows * 4 bytes raw
-    let per_event_repo_ids_raw = num_rows * 4;
+    let _per_event_repo_ids_raw = num_rows * 4;
     // For disambiguation: worst case is 1 extra byte per event with alt name
     // But we'd need actual event counts, not pair counts. Estimate ~0.2% of events.
     let estimated_disambig_events = (num_rows as f64 * 0.002) as usize;  // rough estimate
-    let disambig_overhead = estimated_disambig_events * 2;  // (event_idx, name_idx) sparse
+    let _disambig_overhead = estimated_disambig_events * 2;  // (event_idx, name_idx) sparse
 
     // Check repo_id bit usage
     let max_repo_id = id_to_names.keys().max().copied().unwrap_or(0);
@@ -516,9 +514,9 @@ fn analyze_fst_vs_tsv(mapping_tsv: &[u8], num_rows: usize, per_event_pair_idx: &
     let bits_needed = if max_repo_id > 0 { 32 - max_repo_id.leading_zeros() } else { 0 };
 
     eprintln!("\n=== Repo ID Bit Analysis ===");
-    eprintln!("  Min repo_id:       {:>15}", min_repo_id);
-    eprintln!("  Max repo_id:       {:>15}", max_repo_id);
-    eprintln!("  Bits needed:       {:>15} (max variant needs 2 bits)", bits_needed);
+    eprintln!("  Min repo_id:       {min_repo_id:>15}");
+    eprintln!("  Max repo_id:       {max_repo_id:>15}");
+    eprintln!("  Bits needed:       {bits_needed:>15} (max variant needs 2 bits)");
     eprintln!("  Spare bits in u64: {:>15}", 64 - bits_needed);
     eprintln!("  Spare bits in u32: {:>15}", if bits_needed <= 32 { 32 - bits_needed } else { 0 });
 
@@ -544,7 +542,7 @@ fn analyze_fst_vs_tsv(mapping_tsv: &[u8], num_rows: usize, per_event_pair_idx: &
         }
     }
     let names_with_multi_ids = name_to_ids.values().filter(|v| v.len() > 1).count();
-    eprintln!("  Names with multi IDs: {:>10} (repo transfers)", names_with_multi_ids);
+    eprintln!("  Names with multi IDs: {names_with_multi_ids:>10} (repo transfers)");
 
     // For FST, use first (id, variant) per name
     let mut fst_entries: Vec<(&String, u64)> = name_to_ids.iter()
@@ -554,7 +552,7 @@ fn analyze_fst_vs_tsv(mapping_tsv: &[u8], num_rows: usize, per_event_pair_idx: &
             (*name, combined)
         })
         .collect();
-    fst_entries.sort_by(|a, b| a.0.cmp(&b.0));
+    fst_entries.sort_by(|a, b| a.0.cmp(b.0));
 
     // Build new FST: name -> (repo_id | variant<<30)
     let mut fst_builder2 = MapBuilder::memory();
@@ -621,7 +619,7 @@ fn analyze_fst_vs_tsv(mapping_tsv: &[u8], num_rows: usize, per_event_pair_idx: &
 fn print_column_stats(columns: &EncodedColumns, mapping_tsv: &[u8], mapping_compressed_size: usize) {
     let num_rows = columns.event_id_deltas.len();  // 1 per event
     eprintln!("\n=== Per-Column Compressed Size Estimates ===");
-    eprintln!("Total rows: {}", num_rows);
+    eprintln!("Total rows: {num_rows}");
     eprintln!("{:<20} {:>10} {:>10} {:>8} {:>10}", "Column", "Raw", "Zstd", "Ratio", "B/Row");
     eprintln!("{}", "-".repeat(64));
 
@@ -842,7 +840,7 @@ fn build_mapping_table(events: &[(EventKey, EventValue)]) -> (Vec<u8>, HashMap<(
     let mut pair_to_idx: HashMap<(u32, String), u32> = HashMap::new();
 
     for (idx, (repo_id, repo_name)) in unique_pairs.iter().enumerate() {
-        tsv.push_str(&format!("{}\t{}\n", repo_id, repo_name));
+        tsv.push_str(&format!("{repo_id}\t{repo_name}\n"));
         pair_to_idx.insert((*repo_id, repo_name.clone()), idx as u32);
     }
 
@@ -1029,7 +1027,7 @@ fn decode_columns(
             let (repo_id, repo_name) = &mapping[pair_idx];
 
             let timestamp = timestamps[i];
-            let repo_url = format!("https://api.github.com/repos/{}", repo_name);
+            let repo_url = format!("https://api.github.com/repos/{repo_name}");
 
             (
                 EventKey {
@@ -1061,7 +1059,7 @@ impl EventCodec for NatebrennandCodec {
         let mapping_compressed_size = zstd::encode_all(mapping_tsv.as_slice(), ZSTD_LEVEL)?.len();
 
         if debug_enabled() {
-            eprintln!("\n=== Header ({} bytes) ===", HEADER_SIZE);
+            eprintln!("\n=== Header ({HEADER_SIZE} bytes) ===");
             eprintln!("  first_event_id:       {}", header.first_event_id);
             eprintln!("  first_timestamp:      {} ({})", header.first_timestamp, format_timestamp(header.first_timestamp));
             eprintln!("  mapping_size:         {}", header.mapping_size);
@@ -1105,7 +1103,7 @@ impl EventCodec for NatebrennandCodec {
         buf.extend_from_slice(&compressed);
 
         if debug_enabled() {
-            eprintln!("Uncompressed payload: {} bytes", payload_size);
+            eprintln!("Uncompressed payload: {payload_size} bytes");
             eprintln!("Compressed size (zstd {}): {} bytes", ZSTD_LEVEL, buf.len());
             eprintln!("Compressed bytes/row: {:.2}", buf.len() as f64 / events.len() as f64);
         }

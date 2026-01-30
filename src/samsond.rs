@@ -452,7 +452,7 @@ impl SamsondCodec {
         repo_dict: &RepoDict,
     ) -> (EventKey, EventValue) {
         let (repo_name, repo_id) = repo_dict.get_entry(repo_idx);
-        let repo_url = format!("https://api.github.com/repos/{}", repo_name);
+        let repo_url = format!("https://api.github.com/repos/{repo_name}");
 
         (
             EventKey {

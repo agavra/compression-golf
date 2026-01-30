@@ -346,7 +346,7 @@ impl RepoIdDict {
         for (_, value) in events {
             let name_idx = repo_dict.get_index(&value.repo.name);
             map.entry(value.repo.id)
-                .or_insert_with(HashSet::new)
+                .or_default()
                 .insert(name_idx);
         }
 
@@ -590,16 +590,11 @@ impl EventCodec for XiangpengHaoCodec {
             if debug {
                 let mut row_total = 0usize;
                 for (name, size) in COLUMN_NAMES.iter().zip(section_sizes.iter()) {
-                    eprintln!("XPH_DEBUG row_group col {}: {}", name, size);
+                    eprintln!("XPH_DEBUG row_group col {name}: {size}");
                     row_total += *size;
                 }
                 eprintln!(
-                    "XPH_DEBUG row_group summary: rows={} min_id={} min_ts={} min_repo_id_idx={} bytes={}",
-                    row_count,
-                    min_id,
-                    min_ts,
-                    min_repo_id_idx,
-                    row_total
+                    "XPH_DEBUG row_group summary: rows={row_count} min_id={min_id} min_ts={min_ts} min_repo_id_idx={min_repo_id_idx} bytes={row_total}"
                 );
             }
 
@@ -627,9 +622,9 @@ impl EventCodec for XiangpengHaoCodec {
 
         if debug {
             for (name, size) in COLUMN_NAMES.iter().zip(total_column_sizes.iter()) {
-                eprintln!("XPH_DEBUG total col {}: {}", name, size);
+                eprintln!("XPH_DEBUG total col {name}: {size}");
             }
-            eprintln!("XPH_DEBUG total row_group bytes: {}", total_row_group_bytes);
+            eprintln!("XPH_DEBUG total row_group bytes: {total_row_group_bytes}");
         }
 
         Ok(Bytes::from(out))
@@ -721,7 +716,7 @@ impl EventCodec for XiangpengHaoCodec {
                 }
                 let repo_name_idx = repo_id_dict.name_idx(repo_id_idx, variant_idx);
                 let repo_name = repo_dict.get_string(repo_name_idx).to_string();
-                let repo_url = format!("https://api.github.com/repos/{}", repo_name);
+                let repo_url = format!("https://api.github.com/repos/{repo_name}");
 
                 let event_type = type_dict.get_type(type_idx).to_string();
                 let event_id = min_id + id_offsets[i];
