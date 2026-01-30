@@ -144,6 +144,28 @@ fn assert_events_eq(
     );
 }
 
+fn discover_external_codecs() -> Vec<String> {
+    let src_path = std::path::Path::new("src");
+    let mut codecs = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(src_path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let dockerfile = path.join("Dockerfile");
+                if dockerfile.exists() {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        codecs.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    codecs.sort();
+    codecs
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
 
