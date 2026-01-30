@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader};
 
 mod agavra;
 mod codec;
+mod fabinout;
 mod hachikuji;
 mod naive;
 mod samsond;
@@ -13,6 +14,7 @@ mod zstd;
 
 use agavra::AgavraCodec;
 use codec::EventCodec;
+use fabinout::FabinoutCodec;
 use hachikuji::HachikujiCodec;
 use naive::NaiveCodec;
 use samsond::SamsondCodec;
@@ -182,6 +184,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         (Box::new(ZstdCodec::new(9)), &events),
         // (Box::new(ZstdCodec::new(22)), &events), // commented out b/c it takes long to run
         (Box::new(AgavraCodec::new()), &sorted_events),
+        (Box::new(FabinoutCodec::new()), &events),
         (Box::new(HachikujiCodec::new()), &sorted_events),
         (Box::new(XiangpengHaoCodec::new()), &sorted_events),
         (Box::new(SamsondCodec::new()), &events),
