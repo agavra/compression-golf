@@ -57,7 +57,8 @@
 //!     byte-aligned 24-bit packing compresses better than true bit-packing because
 //!     zstd works on bytes. Saves 100KB vs u32.
 //!   - Varint for timestamp deltas: 99.9% of deltas fit in 1 byte after zigzag encoding.
-//!     Saves 3.8KB vs fixed i16.
+//!     Saves 3.8KB vs fixed i16. Uses i16 range (±32,767 seconds = ~9 hours max gap).
+//!     Will break if adjacent events (sorted by ID) are >9 hours apart.
 //!   - Delta + varint encoding for event_id: Sorting by event_id makes deltas small.
 //!     Varint handles arbitrary gaps safely (vs u8 which would overflow at 256).
 //!     Training data max delta is 251; varint costs only +72 bytes for robustness.
