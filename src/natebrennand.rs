@@ -13,7 +13,7 @@
 //! - Dictionary encode event_type (14 unique values)
 //! - Store unique (repo_id, repo_name) pairs in binary mapping table (ID-sorted)
 //! - Per event, store only an index into the mapping table (24-bit packed)
-//! - Store first event_id in header, deltas as u8 (max delta is 251)
+//! - Store first event_id in header, deltas as varint-encoded u64
 //! - Store first timestamp in header, deltas as varint-encoded i16
 //! - Reconstruct repo.url from repo.name during decode
 //! - Compress each column separately with zstd level 22
@@ -40,7 +40,7 @@
 //!     2. mapping names: newline-separated repo names (in ID order)
 //!     3. event_type dict (newline-separated strings)
 //!     4. event_type indices: 4-bit packed [(num_events+1)/2 bytes]
-//!     5. event_id deltas: [u8; num_events]
+//!     5. event_id deltas: varint-encoded u64
 //!     6. repo_pair indices: 24-bit packed [3 bytes each]
 //!     7. created_at deltas: zigzag + varint encoded
 //!
@@ -58,10 +58,17 @@
 //!     zstd works on bytes. Saves 100KB vs u32.
 //!   - Varint for timestamp deltas: 99.9% of deltas fit in 1 byte after zigzag encoding.
 //!     Saves 3.8KB vs fixed i16.
-//!   - Delta encoding for event_id: Sorting by event_id makes deltas small (max 251),
-//!     fitting in u8. Compresses to 0.35 B/row.
-//!   - Dictionary encoding for event_type: 15 unique values, 4-bit packed indices
-//!     (2 per byte). Compresses to 0.22 B/row.
+//!   - Delta + varint encoding for event_id: Sorting by event_id makes deltas small.
+//!     Varint handles arbitrary gaps safely (vs u8 which would overflow at 256).
+//!     Training data max delta is 251; varint costs only +72 bytes for robustness.
+//!   - Dictionary encoding for event_type: 4-bit packed indices (2 per byte).
+//!     Compresses to 0.22 B/row. GitHub has 16 known event types as of Jan 2026:
+//!     CommitCommentEvent, CreateEvent, DeleteEvent, DiscussionEvent, ForkEvent,
+//!     GollumEvent, IssueCommentEvent, IssuesEvent, MemberEvent, PublicEvent,
+//!     PullRequestEvent, PullRequestReviewCommentEvent, PullRequestReviewEvent,
+//!     PushEvent, ReleaseEvent, WatchEvent.
+//!     4-bit encoding supports max 16 types - will break if GitHub adds more.
+//!     See: https://docs.github.com/en/rest/using-the-rest-api/github-event-types
 //!   - zstd level 22: High compression ratio, acceptable encode time for batch use.
 //!
 //! Compression techniques - what didn't work:
@@ -189,6 +196,43 @@ fn decode_varint_i16(bytes: &[u8], count: usize) -> Vec<i16> {
     result
 }
 
+/// Encode u64 values as unsigned varint
+fn encode_varint_u64(values: &[u64]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(values.len() * 2);
+    for &v in values {
+        let mut val = v;
+        loop {
+            if val < 128 {
+                result.push(val as u8);
+                break;
+            }
+            result.push((val as u8 & 0x7f) | 0x80);
+            val >>= 7;
+        }
+    }
+    result
+}
+
+/// Decode unsigned varint back to u64 values
+fn decode_varint_u64(bytes: &[u8], count: usize) -> Vec<u64> {
+    let mut result = Vec::with_capacity(count);
+    let mut pos = 0;
+    for _ in 0..count {
+        let mut val: u64 = 0;
+        let mut shift = 0;
+        loop {
+            let b = bytes[pos];
+            pos += 1;
+            val |= ((b & 0x7f) as u64) << shift;
+            if b < 128 {
+                break;
+            }
+            shift += 7;
+        }
+        result.push(val);
+    }
+    result
+}
 
 pub struct NatebrennandCodec;
 
@@ -336,7 +380,7 @@ impl Header {
 struct EncodedColumns {
     event_type_dict: Vec<u8>,       // newline-separated event type strings
     event_type_packed: Vec<u8>,     // 4-bit packed indices (2 per byte)
-    event_id_deltas: Vec<u8>,       // u8 deltas
+    event_id_deltas: Vec<u64>,      // u64 deltas (varint encoded during compression)
     repo_pair_indices: Vec<u32>,    // u32 indices
     created_at_deltas: Vec<i16>,    // i16 deltas
 }
@@ -447,15 +491,14 @@ fn parse_mapping_table(id_bytes: &[u8], names_bytes: &[u8], num_entries: usize) 
         .collect()
 }
 
-fn compute_u8_deltas(values: &[u64]) -> Vec<u8> {
+fn compute_u64_deltas(values: &[u64]) -> Vec<u64> {
     if values.is_empty() {
         return Vec::new();
     }
     let mut deltas = Vec::with_capacity(values.len());
-    deltas.push(0u8);
+    deltas.push(0u64);
     for i in 1..values.len() {
-        let delta = values[i] - values[i - 1];
-        deltas.push(delta as u8);
+        deltas.push(values[i] - values[i - 1]);
     }
     deltas
 }
@@ -473,14 +516,14 @@ fn compute_i16_deltas(values: &[i64]) -> Vec<i16> {
     deltas
 }
 
-fn restore_u64_from_deltas(first: u64, deltas: &[u8]) -> Vec<u64> {
+fn restore_u64_from_deltas(first: u64, deltas: &[u64]) -> Vec<u64> {
     if deltas.is_empty() {
         return Vec::new();
     }
     let mut values = Vec::with_capacity(deltas.len());
     values.push(first);
     for i in 1..deltas.len() {
-        values.push(values[i - 1] + deltas[i] as u64);
+        values.push(values[i - 1] + deltas[i]);
     }
     values
 }
@@ -565,7 +608,7 @@ fn encode_events(events: &[(EventKey, EventValue)]) -> Result<((u64, i64, u32, u
     let num_event_types = event_type_dict.split(|&b| b == b'\n').count() as u8;
 
     // Delta encode
-    let event_id_deltas = compute_u8_deltas(&event_ids);
+    let event_id_deltas = compute_u64_deltas(&event_ids);
     let created_at_deltas = compute_i16_deltas(&timestamps);
 
     let columns = EncodedColumns {
@@ -594,7 +637,7 @@ fn decode_columns(
     mapping: &[(u32, String)],
     event_type_dict: &[String],
     event_type_indices: &[u8],
-    event_id_deltas: &[u8],
+    event_id_deltas: &[u64],
     repo_pair_indices: &[u32],
     created_at_deltas: &[i16],
 ) -> Vec<(EventKey, EventValue)> {
@@ -657,7 +700,8 @@ impl EventCodec for NatebrennandCodec {
         let mapping_names_compressed = zstd::encode_all(mapping_names.as_slice(), ZSTD_LEVEL)?;
         let dict_compressed = zstd::encode_all(columns.event_type_dict.as_slice(), ZSTD_LEVEL)?;
         let packed_compressed = zstd::encode_all(columns.event_type_packed.as_slice(), ZSTD_LEVEL)?;
-        let id_deltas_compressed = zstd::encode_all(columns.event_id_deltas.as_slice(), ZSTD_LEVEL)?;
+        let id_deltas_varint = encode_varint_u64(&columns.event_id_deltas);
+        let id_deltas_compressed = zstd::encode_all(id_deltas_varint.as_slice(), ZSTD_LEVEL)?;
         let repo_compressed = zstd::encode_all(repo_bytes.as_slice(), ZSTD_LEVEL)?;
         let ts_compressed = zstd::encode_all(ts_bytes.as_slice(), ZSTD_LEVEL)?;
 
@@ -764,10 +808,11 @@ impl EventCodec for NatebrennandCodec {
         let num_events = header.num_events as usize;
         let event_type_indices = unpack_nibbles(&packed_bytes, num_events);
 
-        // 5. Event ID deltas
+        // 5. Event ID deltas (varint encoded)
         let id_deltas_compressed = &bytes[offset..offset + header.id_deltas_compressed as usize];
         offset += header.id_deltas_compressed as usize;
-        let event_id_deltas = zstd::decode_all(id_deltas_compressed)?;
+        let id_deltas_varint = zstd::decode_all(id_deltas_compressed)?;
+        let event_id_deltas = decode_varint_u64(&id_deltas_varint, num_events);
 
         // 6. Repo pair indices (24-bit packed)
         let repo_compressed = &bytes[offset..offset + header.repo_compressed as usize];
@@ -1402,9 +1447,10 @@ fn print_column_stats(columns: &EncodedColumns, mapping_tsv: &[u8], mapping_comp
         event_type_compressed as f64 / num_rows as f64
     );
 
-    // event_id_delta
-    let eid_raw = columns.event_id_deltas.len();
-    let eid_compressed = zstd::encode_all(columns.event_id_deltas.as_slice(), ZSTD_LEVEL).unwrap().len();
+    // event_id_delta (varint encoded)
+    let eid_varint = encode_varint_u64(&columns.event_id_deltas);
+    let eid_raw = eid_varint.len();
+    let eid_compressed = zstd::encode_all(eid_varint.as_slice(), ZSTD_LEVEL).unwrap().len();
     total_raw += eid_raw;
     total_compressed += eid_compressed;
     eprintln!(
