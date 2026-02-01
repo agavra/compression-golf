@@ -12,6 +12,7 @@ mod naive;
 mod natebrennand;
 mod samsond;
 mod xiangpenghao;
+mod xinyuzeng;
 mod zstd;
 
 use agavra::AgavraCodec;
@@ -23,6 +24,7 @@ use naive::NaiveCodec;
 use natebrennand::NatebrennandCodec;
 use samsond::SamsondCodec;
 use xiangpenghao::XiangpengHaoCodec;
+use xinyuzeng::XinyuZengCodec;
 use zstd::ZstdCodec;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -194,6 +196,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         (Box::new(SamsondCodec::new()), &events),
         (Box::new(JakedgyCodec::new()), &sorted_events),
         (Box::new(NatebrennandCodec::new()), &sorted_events),
+        (Box::new(XinyuZengCodec::new()), &sorted_events),
     ];
 
     for (codec, expected) in codecs {
