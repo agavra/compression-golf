@@ -6,6 +6,7 @@ use std::io::{BufRead, BufReader};
 mod agavra;
 mod codec;
 mod fabinout;
+mod fulmicoton;
 mod hachikuji;
 mod jakedgy;
 mod naive;
@@ -24,6 +25,8 @@ use natebrennand::NatebrennandCodec;
 use samsond::SamsondCodec;
 use xiangpenghao::XiangpengHaoCodec;
 use zstd::ZstdCodec;
+
+use crate::fulmicoton::FulmicotonCodec;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EventKey {
@@ -194,6 +197,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         (Box::new(SamsondCodec::new()), &events),
         (Box::new(JakedgyCodec::new()), &sorted_events),
         (Box::new(NatebrennandCodec::new()), &sorted_events),
+        (Box::new(FulmicotonCodec), &sorted_events),
     ];
 
     for (codec, expected) in codecs {
