@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use crate::codec::EventCodec;
 use crate::{EventKey, EventValue, Repo};
 
+#[allow(non_camel_case_types)]
 pub struct Sayan_Codec;
 
 impl Sayan_Codec {
@@ -92,6 +93,59 @@ fn decompress_bzip2(data: &[u8]) -> Vec<u8> {
     output
 }
 
+const LRU_CACHE_SIZE: usize = 64;
+
+fn lru_encode_repo_indices(repo_indices: &[u32]) -> Vec<u8> {
+    let mut cache: Vec<u32> = Vec::with_capacity(LRU_CACHE_SIZE);
+    let mut output = Vec::new();
+
+    for &idx in repo_indices {
+        if let Some(pos) = cache.iter().position(|&x| x == idx) {
+            output.push(pos as u8);
+            cache.remove(pos);
+            cache.insert(0, idx);
+        } else {
+            output.push(0xFF);
+            output.push(idx as u8);
+            output.push((idx >> 8) as u8);
+            output.push((idx >> 16) as u8);
+            if cache.len() >= LRU_CACHE_SIZE {
+                cache.pop();
+            }
+            cache.insert(0, idx);
+        }
+    }
+    output
+}
+
+fn lru_decode_repo_indices(data: &[u8], count: usize) -> Vec<u32> {
+    let mut cache: Vec<u32> = Vec::with_capacity(LRU_CACHE_SIZE);
+    let mut result = Vec::with_capacity(count);
+    let mut pos = 0;
+
+    for _ in 0..count {
+        let b = data[pos];
+        pos += 1;
+
+        if b == 0xFF {
+            let idx = data[pos] as u32 | ((data[pos+1] as u32) << 8) | ((data[pos+2] as u32) << 16);
+            pos += 3;
+            result.push(idx);
+            if cache.len() >= LRU_CACHE_SIZE {
+                cache.pop();
+            }
+            cache.insert(0, idx);
+        } else {
+            let cache_pos = b as usize;
+            let idx = cache[cache_pos];
+            result.push(idx);
+            cache.remove(cache_pos);
+            cache.insert(0, idx);
+        }
+    }
+    result
+}
+
 impl EventCodec for Sayan_Codec {
     fn name(&self) -> &str { "Sayan-" }
 
@@ -100,7 +154,7 @@ impl EventCodec for Sayan_Codec {
         for (_, v) in events { repo_set.insert((v.repo.id, v.repo.name.as_str()), ()); }
         let mut repo_list: Vec<(u64, &str)> = repo_set.into_keys().collect();
         repo_list.sort_by_key(|(id, _)| *id);
-        
+
         let repo_to_idx: HashMap<(u64, &str), u32> = repo_list.iter().enumerate()
             .map(|(i, (id, name))| ((*id, *name), i as u32)).collect();
 
@@ -126,7 +180,7 @@ impl EventCodec for Sayan_Codec {
             repo_indices.push(repo_to_idx[&(value.repo.id, value.repo.name.as_str())]);
             timestamps.push(parse_timestamp(&value.created_at));
         }
-        
+
         let event_type_dict = event_type_list.join("\n");
 
         let mut repo_ids_data: Vec<u8> = Vec::new();
@@ -150,15 +204,13 @@ impl EventCodec for Sayan_Codec {
             types_packed.push(chunk[0] | (chunk.get(1).copied().unwrap_or(0) << 4));
         }
 
-        let repo_idx_packed: Vec<u8> = repo_indices.iter()
-            .flat_map(|&idx| [idx as u8, (idx >> 8) as u8, (idx >> 16) as u8])
-            .collect();
+        let repo_idx_lru = lru_encode_repo_indices(&repo_indices);
 
         let repo_ids_c = compress_brotli(&repo_ids_data, 10);
         let repo_names_c = compress_brotli(repo_names.as_bytes(), 11);
         let id_deltas_c = compress_brotli(&id_deltas, 10);
         let types_c = compress_zopfli(&types_packed);
-        let repo_idx_c = compress_bzip2(&repo_idx_packed);
+        let repo_idx_c = compress_bzip2(&repo_idx_lru);
         let ts_deltas_c = compress_bzip2(&ts_deltas);
         let event_type_dict_c = compress_brotli(event_type_dict.as_bytes(), 11);
 
@@ -168,10 +220,10 @@ impl EventCodec for Sayan_Codec {
         output.extend_from_slice(&(event_type_list.len() as u8).to_le_bytes());
         output.extend_from_slice(&first_id.to_le_bytes());
         output.extend_from_slice(&first_ts.to_le_bytes());
-        
+
         output.extend_from_slice(&(event_type_dict_c.len() as u16).to_le_bytes());
         output.extend_from_slice(&event_type_dict_c);
-        
+
         for col in [&repo_ids_c, &repo_names_c, &id_deltas_c, &types_c, &repo_idx_c, &ts_deltas_c] {
             output.extend_from_slice(&(col.len() as u32).to_le_bytes());
             output.extend_from_slice(col);
@@ -187,55 +239,53 @@ impl EventCodec for Sayan_Codec {
         let _num_event_types = bytes[pos] as usize; pos += 1;
         let first_id = u64::from_le_bytes(bytes[pos..pos+8].try_into()?); pos += 8;
         let first_ts = i64::from_le_bytes(bytes[pos..pos+8].try_into()?); pos += 8;
-        
+
         let len = u16::from_le_bytes(bytes[pos..pos+2].try_into()?) as usize; pos += 2;
         let event_type_dict_data = decompress_brotli(&bytes[pos..pos+len]); pos += len;
         let event_type_dict_str = std::str::from_utf8(&event_type_dict_data)?;
         let event_type_list: Vec<&str> = event_type_dict_str.split('\n').collect();
-        
+
         let len = u32::from_le_bytes(bytes[pos..pos+4].try_into()?) as usize; pos += 4;
         let repo_ids_data = decompress_brotli(&bytes[pos..pos+len]); pos += len;
-        
+
         let len = u32::from_le_bytes(bytes[pos..pos+4].try_into()?) as usize; pos += 4;
         let repo_names_data = decompress_brotli(&bytes[pos..pos+len]); pos += len;
-        
+
         let len = u32::from_le_bytes(bytes[pos..pos+4].try_into()?) as usize; pos += 4;
         let id_deltas_data = decompress_brotli(&bytes[pos..pos+len]); pos += len;
-        
+
         let len = u32::from_le_bytes(bytes[pos..pos+4].try_into()?) as usize; pos += 4;
         let types_data = decompress_zopfli(&bytes[pos..pos+len]); pos += len;
-        
+
         let len = u32::from_le_bytes(bytes[pos..pos+4].try_into()?) as usize; pos += 4;
         let repo_idx_data = decompress_bzip2(&bytes[pos..pos+len]); pos += len;
-        
+
         let len = u32::from_le_bytes(bytes[pos..pos+4].try_into()?) as usize; pos += 4;
         let ts_deltas_data = decompress_bzip2(&bytes[pos..pos+len]);
-        
+
         let repo_id_deltas = decode_varints(&repo_ids_data, num_repos);
         let mut repo_ids = Vec::with_capacity(num_repos);
         let mut prev: u64 = 0;
         for d in repo_id_deltas { prev += d; repo_ids.push(prev); }
         let repo_names: Vec<&str> = std::str::from_utf8(&repo_names_data)?.split('\n').collect();
         let repos: Vec<(u64, &str)> = repo_ids.into_iter().zip(repo_names).collect();
-        
+
         let id_deltas = decode_varints(&id_deltas_data, num_events - 1);
         let mut event_ids = vec![first_id];
         for d in id_deltas { event_ids.push(event_ids.last().unwrap() + d); }
-        
+
         let mut event_types = Vec::with_capacity(num_events);
         for &b in &types_data {
             event_types.push(b & 0x0F);
             if event_types.len() < num_events { event_types.push(b >> 4); }
         }
-        
-        let repo_indices: Vec<u32> = repo_idx_data.chunks(3)
-            .map(|c| c[0] as u32 | ((c[1] as u32) << 8) | ((c[2] as u32) << 16))
-            .collect();
-        
+
+        let repo_indices = lru_decode_repo_indices(&repo_idx_data, num_events);
+
         let ts_deltas = decode_varints(&ts_deltas_data, num_events - 1);
         let mut timestamps = vec![first_ts];
         for d in ts_deltas { timestamps.push(timestamps.last().unwrap() + zigzag_decode(d)); }
-        
+
         let mut events = Vec::with_capacity(num_events);
         for i in 0..num_events {
             let (repo_id, repo_name) = repos[repo_indices[i] as usize];
