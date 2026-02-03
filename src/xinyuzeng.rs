@@ -21,7 +21,7 @@ use crate::{EventKey, EventValue, Repo};
 const MAGIC: &[u8; 4] = b"XYZ1";
 const ZSTD_LEVEL: i32 = 22;
 
-const COLUMN_NAMES: [&str; 11] = [
+const COLUMN_NAMES: [&str; 10] = [
     "type_dict",
     "repo_ids",
     "repo_names",
@@ -30,7 +30,6 @@ const COLUMN_NAMES: [&str; 11] = [
     "dup_name_table",
     "dup_row_bitmap",
     "dup_variant_idx",
-    "repo_name_variant_idx",
     "id_deltas",
     "ts_deltas",
 ];
@@ -546,7 +545,6 @@ impl EventCodec for XinyuzengCodec {
             zstd::encode_all(repo_dict.encode_repo_names().as_slice(), ZSTD_LEVEL)?;
 
         let mut type_idx = Vec::with_capacity(sorted_events.len());
-        let mut repo_name_variant_idx = Vec::with_capacity(sorted_events.len());
         let mut repo_name_idx = Vec::with_capacity(sorted_events.len());
         let mut ids = Vec::with_capacity(sorted_events.len());
         let mut timestamps = Vec::with_capacity(sorted_events.len());
@@ -556,9 +554,6 @@ impl EventCodec for XinyuzengCodec {
 
         for (key, value) in &sorted_events {
             type_idx.push(type_dict.get_index(&key.event_type));
-            let id_idx = repo_dict.repo_id_index(value.repo.id);
-            repo_name_variant_idx.push(repo_dict.repo_name_index(id_idx, &value.repo.name));
-
             let name_idx = repo_dict.repo_name_global_index(&value.repo.name);
             repo_name_idx.push(name_idx);
             name_id_sets
@@ -630,10 +625,6 @@ impl EventCodec for XinyuzengCodec {
         let dup_row_bitmap_bytes = zstd::encode_all(dup_row_bitmap.as_slice(), ZSTD_LEVEL)?;
         let dup_variant_idx_bytes =
             zstd::encode_all(encode_u32_list(&dup_variant_idx).as_slice(), ZSTD_LEVEL)?;
-        let repo_name_variant_idx_bytes = zstd::encode_all(
-            pack_bits_u32(&repo_name_variant_idx).as_slice(),
-            ZSTD_LEVEL,
-        )?;
         let id_deltas_bytes = zstd::encode_all(pack_bits_u64(&id_deltas).as_slice(), ZSTD_LEVEL)?;
         let ts_deltas_bytes = zstd::encode_all(pack_bits_u64(&ts_deltas).as_slice(), ZSTD_LEVEL)?;
 
@@ -648,7 +639,6 @@ impl EventCodec for XinyuzengCodec {
                 dup_name_meta_bytes.len(),
                 dup_row_bitmap_bytes.len(),
                 dup_variant_idx_bytes.len(),
-                repo_name_variant_idx_bytes.len(),
                 id_deltas_bytes.len(),
                 ts_deltas_bytes.len(),
             ];
@@ -679,7 +669,6 @@ impl EventCodec for XinyuzengCodec {
         write_section(&mut out, &dup_name_ids_bytes);
         write_section(&mut out, &dup_row_bitmap_bytes);
         write_section(&mut out, &dup_variant_idx_bytes);
-        write_section(&mut out, &repo_name_variant_idx_bytes);
         write_section(&mut out, &id_deltas_bytes);
         write_section(&mut out, &ts_deltas_bytes);
 
@@ -717,7 +706,6 @@ impl EventCodec for XinyuzengCodec {
         let dup_name_ids_raw = read_section(bytes, &mut pos)?;
         let dup_row_bitmap_raw = read_section(bytes, &mut pos)?;
         let dup_variant_idx_raw = read_section(bytes, &mut pos)?;
-        let repo_name_variant_idx_raw = read_section(bytes, &mut pos)?;
         let id_deltas_raw = read_section(bytes, &mut pos)?;
         let ts_deltas_raw = read_section(bytes, &mut pos)?;
 
@@ -730,7 +718,6 @@ impl EventCodec for XinyuzengCodec {
         let dup_name_ids = decode_u32_list(&dup_name_ids_raw)?;
         let dup_row_bitmap = dup_row_bitmap_raw;
         let dup_variant_idx = decode_u32_list(&dup_variant_idx_raw)?;
-        let _repo_name_variant_idx = unpack_bits_u32(&repo_name_variant_idx_raw, row_count)?;
         let id_deltas = unpack_bits_u64(&id_deltas_raw, row_count)?;
         let ts_deltas = unpack_bits_u64(&ts_deltas_raw, row_count)?;
 
