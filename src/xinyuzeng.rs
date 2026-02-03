@@ -6,6 +6,9 @@
 //! Successful optimizations:
 //! - Split base from id_deltas: 6,283,516 → 6,214,202 bytes (-69KB, -1.1%)
 //!   id_deltas: 533,986 → 464,672 (-69KB)
+//! - Remove zigzag for id_deltas: 6,214,202 → 6,098,398 bytes (-116KB, -1.9%)
+//!   id_deltas: 464,672 → 348,868 (-116KB). Since IDs are sorted, deltas are
+//!   always non-negative, so zigzag wastes 1 bit per value.
 //!
 //! Tried and reverted (worse sizes than current baseline):
 //! - Split repo_names into counts/lengths/bytes streams.
@@ -15,6 +18,7 @@
 //! - Front-coded repo name dictionary.
 //! - Delta+bitpack dup_name_meta/dup_name_ids (6,284,344 bytes).
 //! - Split base from ts_deltas (+728 bytes, zstd already handles it well).
+//! - Entropy coding (Huffman/FSE) for id_deltas: zstd already achieves near-optimal.
 
 use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
@@ -298,6 +302,30 @@ fn delta_decode_unsigned(values: &[u64]) -> Vec<u64> {
     out.push(cur);
     for &v in values.iter().skip(1) {
         cur += v;
+        out.push(cur);
+    }
+    out
+}
+
+/// Encode unsigned deltas with base stored separately, returning raw bytes.
+/// Since IDs are sorted, all deltas are non-negative and fit in u8 (max 251).
+/// This avoids the wasteful zigzag transform that doubles positive values.
+fn delta_encode_u8_split(values: &[u64]) -> (u64, Vec<u8>) {
+    if values.is_empty() {
+        return (0, Vec::new());
+    }
+    let base = values[0];
+    let deltas: Vec<u8> = values.windows(2).map(|w| (w[1] - w[0]) as u8).collect();
+    (base, deltas)
+}
+
+/// Decode values from base + raw u8 deltas
+fn delta_decode_u8_split(base: u64, deltas: &[u8]) -> Vec<u64> {
+    let mut out = Vec::with_capacity(deltas.len() + 1);
+    out.push(base);
+    let mut cur = base;
+    for &d in deltas {
+        cur += d as u64;
         out.push(cur);
     }
     out
@@ -643,8 +671,9 @@ impl EventCodec for XinyuzengCodec {
             }
         }
 
-        // Split base from deltas to avoid base inflating bit width for all values
-        let (id_base, id_deltas) = delta_encode_signed_split(&ids)?;
+        // Use unsigned encoding for id_deltas since all deltas are non-negative after sorting
+        // This avoids the wasteful zigzag transform (which doubles positive values)
+        let (id_base, id_deltas) = delta_encode_u8_split(&ids);
         let ts_deltas = delta_encode_signed(&timestamps)?;
 
         let type_idx_bytes = zstd::encode_all(pack_bits_u32(&type_idx).as_slice(), ZSTD_LEVEL)?;
@@ -658,9 +687,9 @@ impl EventCodec for XinyuzengCodec {
         let dup_variant_idx_bytes =
             zstd::encode_all(encode_u32_list(&dup_variant_idx).as_slice(), ZSTD_LEVEL)?;
 
-        // Pack base value (8 bytes) followed by bitpacked deltas for id_deltas
+        // Pack base value (8 bytes) followed by raw u8 deltas
         let mut id_raw = id_base.to_le_bytes().to_vec();
-        id_raw.extend_from_slice(&pack_bits_u64(&id_deltas));
+        id_raw.extend_from_slice(&id_deltas);
         let id_deltas_bytes = zstd::encode_all(id_raw.as_slice(), ZSTD_LEVEL)?;
 
         let ts_deltas_bytes = zstd::encode_all(pack_bits_u64(&ts_deltas).as_slice(), ZSTD_LEVEL)?;
@@ -756,13 +785,12 @@ impl EventCodec for XinyuzengCodec {
         let dup_row_bitmap = dup_row_bitmap_raw;
         let dup_variant_idx = decode_u32_list(&dup_variant_idx_raw)?;
 
-        // Read base (8 bytes) then unpack deltas for id_deltas
+        // Read base (8 bytes) then raw u8 deltas for id_deltas
         if id_deltas_raw.len() < 8 {
             return Err("id_deltas too short".into());
         }
         let id_base = u64::from_le_bytes(id_deltas_raw[0..8].try_into().unwrap());
-        let id_deltas = unpack_bits_u64(&id_deltas_raw[8..], row_count.saturating_sub(1))?;
-        let ids = delta_decode_signed_split(id_base, &id_deltas)?;
+        let ids = delta_decode_u8_split(id_base, &id_deltas_raw[8..]);
 
         let ts_deltas = unpack_bits_u64(&ts_deltas_raw, row_count)?;
         let timestamps = delta_decode_signed(&ts_deltas)?;
