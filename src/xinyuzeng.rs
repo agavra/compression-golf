@@ -16,6 +16,10 @@
 //!   repo_name_idx: 2,232,905 → 1,950,325 (-283KB). Move-to-Front transform
 //!   exploits temporal locality, then byte planes help compress high bytes
 //!   (29% of MTF values < 256, 69% < 65536).
+//! - Limited-alphabet MTF: 5,723,601 → 5,784,824 bytes (+61KB, +1.1%)
+//!   Performance fix: full MTF with 261K unique repos was O(n*m) = 2+ min runtime.
+//!   Limit MTF to top 4096 frequent repos, fallback encoding for others.
+//!   Runtime: 2+ min → ~12 sec (10x faster), acceptable size tradeoff.
 //!
 //! Tried and reverted (worse sizes than current baseline):
 //! - Split repo_names into counts/lengths/bytes streams.
@@ -344,6 +348,11 @@ fn delta_decode_u8_split(base: u64, deltas: &[u8]) -> Vec<u64> {
     out
 }
 
+/// Maximum alphabet size for MTF transform.
+/// Values beyond this use fallback encoding (raw indices).
+/// 4096 covers ~35% of events but keeps MTF O(n*K) manageable.
+const MTF_ALPHABET_SIZE: usize = 4096;
+
 /// Move-to-Front encode: transforms values so recently-used get small indices.
 /// Exploits temporal locality - if the same value reappears soon, it gets a small index.
 fn mtf_encode(values: &[u32], max_val: u32) -> Vec<u32> {
@@ -386,6 +395,126 @@ fn mtf_decode(values: &[u32], max_val: u32) -> Vec<u32> {
         }
     }
     output
+}
+
+/// Result of limited-alphabet MTF encoding
+struct LimitedMtfEncoded {
+    /// Top-K original indices, sorted by frequency (most frequent first)
+    top_k_indices: Vec<u32>,
+    /// Bitmap: 1 = use MTF, 0 = use fallback
+    use_mtf_bitmap: Vec<u8>,
+    /// MTF-encoded values for rows where use_mtf=1
+    mtf_values: Vec<u32>,
+    /// Original indices for rows where use_mtf=0
+    fallback_values: Vec<u32>,
+}
+
+/// Encode repo_name_idx using limited-alphabet MTF.
+/// Only the top K most frequent indices use MTF encoding.
+/// Infrequent indices are stored directly as fallback.
+fn limited_mtf_encode(values: &[u32]) -> LimitedMtfEncoded {
+    // Count frequencies
+    let mut freq: HashMap<u32, usize> = HashMap::new();
+    for &v in values {
+        *freq.entry(v).or_insert(0) += 1;
+    }
+
+    // Sort by frequency (descending), then by index for determinism
+    let mut freq_vec: Vec<(u32, usize)> = freq.into_iter().collect();
+    freq_vec.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    // Select top K
+    let k = MTF_ALPHABET_SIZE.min(freq_vec.len());
+    let top_k_indices: Vec<u32> = freq_vec.iter().take(k).map(|(idx, _)| *idx).collect();
+
+    // Build mapping: original_idx -> MTF alphabet position (0..K-1)
+    let mut idx_to_mtf: HashMap<u32, u32> = HashMap::with_capacity(k);
+    for (mtf_pos, &orig_idx) in top_k_indices.iter().enumerate() {
+        idx_to_mtf.insert(orig_idx, mtf_pos as u32);
+    }
+
+    // Separate values into MTF and fallback streams
+    let mut use_mtf_bitmap = vec![0u8; values.len().div_ceil(8)];
+    let mut mtf_input: Vec<u32> = Vec::new();
+    let mut fallback_values: Vec<u32> = Vec::new();
+
+    for (i, &v) in values.iter().enumerate() {
+        if let Some(&mtf_pos) = idx_to_mtf.get(&v) {
+            // Mark as MTF
+            use_mtf_bitmap[i / 8] |= 1 << (i % 8);
+            mtf_input.push(mtf_pos);
+        } else {
+            // Fallback: store original index
+            fallback_values.push(v);
+        }
+    }
+
+    // Apply MTF only to the selected values (alphabet size = K)
+    let mtf_values = if mtf_input.is_empty() {
+        Vec::new()
+    } else {
+        let max_mtf = (k - 1) as u32;
+        mtf_encode(&mtf_input, max_mtf)
+    };
+
+    LimitedMtfEncoded {
+        top_k_indices,
+        use_mtf_bitmap,
+        mtf_values,
+        fallback_values,
+    }
+}
+
+/// Decode limited-alphabet MTF back to original indices.
+fn limited_mtf_decode(
+    top_k_indices: &[u32],
+    use_mtf_bitmap: &[u8],
+    mtf_values: &[u32],
+    fallback_values: &[u32],
+    row_count: usize,
+) -> Result<Vec<u32>, Box<dyn Error>> {
+    // Decode MTF values back to MTF alphabet positions
+    let decoded_mtf = if mtf_values.is_empty() {
+        Vec::new()
+    } else {
+        let max_mtf = (top_k_indices.len() - 1) as u32;
+        mtf_decode(mtf_values, max_mtf)
+    };
+
+    // Reconstruct original indices
+    let mut output = Vec::with_capacity(row_count);
+    let mut mtf_cursor = 0usize;
+    let mut fallback_cursor = 0usize;
+
+    for i in 0..row_count {
+        let byte = i / 8;
+        let bit = i % 8;
+        let use_mtf = if byte < use_mtf_bitmap.len() {
+            (use_mtf_bitmap[byte] >> bit) & 1 == 1
+        } else {
+            false
+        };
+
+        if use_mtf {
+            if mtf_cursor >= decoded_mtf.len() {
+                return Err("MTF cursor overflow".into());
+            }
+            let mtf_pos = decoded_mtf[mtf_cursor] as usize;
+            if mtf_pos >= top_k_indices.len() {
+                return Err("MTF position out of range".into());
+            }
+            output.push(top_k_indices[mtf_pos]);
+            mtf_cursor += 1;
+        } else {
+            if fallback_cursor >= fallback_values.len() {
+                return Err("Fallback cursor overflow".into());
+            }
+            output.push(fallback_values[fallback_cursor]);
+            fallback_cursor += 1;
+        }
+    }
+
+    Ok(output)
 }
 
 struct StringDict {
@@ -793,34 +922,63 @@ impl EventCodec for XinyuzengCodec {
 
         let type_idx_bytes = zstd::encode_all(pack_bits_u32(&type_idx).as_slice(), ZSTD_LEVEL)?;
 
-        // Apply MTF transform then byte plane splitting for repo_name_idx
+        // Apply limited-alphabet MTF transform for repo_name_idx
+        // Only top-K frequent indices use MTF; others use fallback encoding
         let repo_name_idx_bytes = {
-            let max_idx = *repo_name_idx.iter().max().unwrap_or(&0);
-            let mtf = mtf_encode(&repo_name_idx, max_idx);
+            let encoded = limited_mtf_encode(&repo_name_idx);
 
-            // Split into byte planes
-            let mut high_bytes = Vec::with_capacity(mtf.len());
-            let mut mid_bytes = Vec::with_capacity(mtf.len());
-            let mut low_bytes = Vec::with_capacity(mtf.len());
-            for &v in &mtf {
-                high_bytes.push((v >> 16) as u8);
-                mid_bytes.push((v >> 8) as u8);
-                low_bytes.push(v as u8);
-            }
+            // Compress top_k_indices
+            let top_k_bytes = zstd::encode_all(
+                encode_u32_list(&encoded.top_k_indices).as_slice(),
+                ZSTD_LEVEL,
+            )?;
 
-            // Compress each plane
-            let high_c = zstd::encode_all(high_bytes.as_slice(), ZSTD_LEVEL)?;
-            let mid_c = zstd::encode_all(mid_bytes.as_slice(), ZSTD_LEVEL)?;
-            let low_c = zstd::encode_all(low_bytes.as_slice(), ZSTD_LEVEL)?;
+            // Compress bitmap
+            let bitmap_bytes = zstd::encode_all(encoded.use_mtf_bitmap.as_slice(), ZSTD_LEVEL)?;
 
-            // Pack: [max_idx:u32][high_len:u32][mid_len:u32][high][mid][low]
+            // MTF values: byte-plane split for better compression
+            let (mtf_high, mtf_mid, mtf_low): (Vec<u8>, Vec<u8>, Vec<u8>) = encoded
+                .mtf_values
+                .iter()
+                .map(|&v| ((v >> 16) as u8, (v >> 8) as u8, v as u8))
+                .fold(
+                    (Vec::new(), Vec::new(), Vec::new()),
+                    |(mut h, mut m, mut l), (hv, mv, lv)| {
+                        h.push(hv);
+                        m.push(mv);
+                        l.push(lv);
+                        (h, m, l)
+                    },
+                );
+            let mtf_high_c = zstd::encode_all(mtf_high.as_slice(), ZSTD_LEVEL)?;
+            let mtf_mid_c = zstd::encode_all(mtf_mid.as_slice(), ZSTD_LEVEL)?;
+            let mtf_low_c = zstd::encode_all(mtf_low.as_slice(), ZSTD_LEVEL)?;
+
+            // Fallback values: bitpacked
+            let fallback_bytes = zstd::encode_all(
+                pack_bits_u32(&encoded.fallback_values).as_slice(),
+                ZSTD_LEVEL,
+            )?;
+
+            // Pack format:
+            // [top_k_len:u32][bitmap_len:u32][mtf_high_len:u32][mtf_mid_len:u32][mtf_low_len:u32][fallback_len:u32]
+            // [mtf_count:u32][fallback_count:u32]
+            // [top_k][bitmap][mtf_high][mtf_mid][mtf_low][fallback]
             let mut buf = Vec::new();
-            buf.extend_from_slice(&max_idx.to_le_bytes());
-            buf.extend_from_slice(&(high_c.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&(mid_c.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&high_c);
-            buf.extend_from_slice(&mid_c);
-            buf.extend_from_slice(&low_c);
+            buf.extend_from_slice(&(top_k_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&(bitmap_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&(mtf_high_c.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&(mtf_mid_c.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&(mtf_low_c.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&(fallback_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&(encoded.mtf_values.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&(encoded.fallback_values.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&top_k_bytes);
+            buf.extend_from_slice(&bitmap_bytes);
+            buf.extend_from_slice(&mtf_high_c);
+            buf.extend_from_slice(&mtf_mid_c);
+            buf.extend_from_slice(&mtf_low_c);
+            buf.extend_from_slice(&fallback_bytes);
             buf
         };
 
@@ -858,188 +1016,6 @@ impl EventCodec for XinyuzengCodec {
                 eprintln!("XINYU_DEBUG col {}: {}", name, size);
             }
             eprintln!("XINYU_DEBUG total bytes: {}", total);
-
-            // repo_name_idx detailed analysis
-            let max_idx = *repo_name_idx.iter().max().unwrap_or(&0);
-            let min_idx = *repo_name_idx.iter().min().unwrap_or(&0);
-            let bits_needed = if max_idx == 0 {
-                1
-            } else {
-                32 - max_idx.leading_zeros()
-            };
-
-            // Count runs (consecutive identical values)
-            let mut run_count = 1usize;
-            for w in repo_name_idx.windows(2) {
-                if w[0] != w[1] {
-                    run_count += 1;
-                }
-            }
-
-            // Unique values
-            let unique: HashSet<u32> = repo_name_idx.iter().copied().collect();
-
-            // Frequency distribution
-            let mut freq: HashMap<u32, usize> = HashMap::new();
-            for &idx in &repo_name_idx {
-                *freq.entry(idx).or_insert(0) += 1;
-            }
-            let mut freq_vec: Vec<_> = freq.into_iter().collect();
-            freq_vec.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
-
-            // Test byte plane splitting
-            let mut high_bytes = Vec::with_capacity(repo_name_idx.len());
-            let mut mid_bytes = Vec::with_capacity(repo_name_idx.len());
-            let mut low_bytes = Vec::with_capacity(repo_name_idx.len());
-            for &v in &repo_name_idx {
-                high_bytes.push((v >> 16) as u8);
-                mid_bytes.push((v >> 8) as u8);
-                low_bytes.push(v as u8);
-            }
-            let high_compressed = zstd::encode_all(high_bytes.as_slice(), ZSTD_LEVEL)
-                .unwrap()
-                .len();
-            let mid_compressed = zstd::encode_all(mid_bytes.as_slice(), ZSTD_LEVEL)
-                .unwrap()
-                .len();
-            let low_compressed = zstd::encode_all(low_bytes.as_slice(), ZSTD_LEVEL)
-                .unwrap()
-                .len();
-            let planes_total = high_compressed + mid_compressed + low_compressed;
-
-            eprintln!("XINYU_DEBUG repo_name_idx analysis:");
-            eprintln!(
-                "  range: {} - {} ({} bits needed)",
-                min_idx, max_idx, bits_needed
-            );
-            eprintln!("  unique values: {}", unique.len());
-            eprintln!(
-                "  runs: {} (avg run len: {:.2})",
-                run_count,
-                repo_name_idx.len() as f64 / run_count as f64
-            );
-            eprintln!("  top 5 freq: {:?}", &freq_vec[..5.min(freq_vec.len())]);
-            eprintln!(
-                "  byte planes: high={} mid={} low={} total={}",
-                high_compressed, mid_compressed, low_compressed, planes_total
-            );
-            eprintln!("  current (bitpack+zstd): {}", repo_name_idx_bytes.len());
-            eprintln!(
-                "  byte planes savings: {} bytes ({:.1}%)",
-                repo_name_idx_bytes.len() as i64 - planes_total as i64,
-                100.0 * (1.0 - planes_total as f64 / repo_name_idx_bytes.len() as f64)
-            );
-
-            // Test frequency-based reordering
-            // Assign lowest indices to most frequent repos
-            let mut idx_remap: HashMap<u32, u32> = HashMap::new();
-            for (new_idx, (old_idx, _)) in freq_vec.iter().enumerate() {
-                idx_remap.insert(*old_idx, new_idx as u32);
-            }
-            let freq_reordered: Vec<u32> = repo_name_idx.iter().map(|&v| idx_remap[&v]).collect();
-            let freq_reordered_bytes =
-                zstd::encode_all(pack_bits_u32(&freq_reordered).as_slice(), ZSTD_LEVEL)
-                    .unwrap()
-                    .len();
-            eprintln!(
-                "  freq-reorder (bitpack+zstd): {} (savings: {} bytes, {:.1}%)",
-                freq_reordered_bytes,
-                repo_name_idx_bytes.len() as i64 - freq_reordered_bytes as i64,
-                100.0 * (1.0 - freq_reordered_bytes as f64 / repo_name_idx_bytes.len() as f64)
-            );
-
-            // Test Move-to-Front transform
-            // Recently used indices get small numbers
-            let mut mtf_list: Vec<u32> = (0..=max_idx).collect();
-            let mut mtf_positions: Vec<u32> = (0..=max_idx).collect(); // inverse: mtf_positions[val] = position in mtf_list
-            let mut mtf_output: Vec<u32> = Vec::with_capacity(repo_name_idx.len());
-            for &val in &repo_name_idx {
-                let pos = mtf_positions[val as usize];
-                mtf_output.push(pos);
-                // Move val to front
-                if pos > 0 {
-                    for i in (1..=pos as usize).rev() {
-                        mtf_list[i] = mtf_list[i - 1];
-                        mtf_positions[mtf_list[i] as usize] = i as u32;
-                    }
-                    mtf_list[0] = val;
-                    mtf_positions[val as usize] = 0;
-                }
-            }
-            let mtf_bytes = zstd::encode_all(pack_bits_u32(&mtf_output).as_slice(), ZSTD_LEVEL)
-                .unwrap()
-                .len();
-            let mtf_max = *mtf_output.iter().max().unwrap_or(&0);
-            let mtf_under_256 = mtf_output.iter().filter(|&&v| v < 256).count();
-            let mtf_under_65536 = mtf_output.iter().filter(|&&v| v < 65536).count();
-            eprintln!(
-                "  MTF (bitpack+zstd): {} (savings: {} bytes, {:.1}%)",
-                mtf_bytes,
-                repo_name_idx_bytes.len() as i64 - mtf_bytes as i64,
-                100.0 * (1.0 - mtf_bytes as f64 / repo_name_idx_bytes.len() as f64)
-            );
-            eprintln!(
-                "  MTF stats: max={} under256={:.1}% under65536={:.1}%",
-                mtf_max,
-                100.0 * mtf_under_256 as f64 / repo_name_idx.len() as f64,
-                100.0 * mtf_under_65536 as f64 / repo_name_idx.len() as f64
-            );
-
-            // Test MTF + byte planes
-            let mut mtf_high = Vec::with_capacity(mtf_output.len());
-            let mut mtf_mid = Vec::with_capacity(mtf_output.len());
-            let mut mtf_low = Vec::with_capacity(mtf_output.len());
-            for &v in &mtf_output {
-                mtf_high.push((v >> 16) as u8);
-                mtf_mid.push((v >> 8) as u8);
-                mtf_low.push(v as u8);
-            }
-            let mtf_high_c = zstd::encode_all(mtf_high.as_slice(), ZSTD_LEVEL)
-                .unwrap()
-                .len();
-            let mtf_mid_c = zstd::encode_all(mtf_mid.as_slice(), ZSTD_LEVEL)
-                .unwrap()
-                .len();
-            let mtf_low_c = zstd::encode_all(mtf_low.as_slice(), ZSTD_LEVEL)
-                .unwrap()
-                .len();
-            let mtf_planes_total = mtf_high_c + mtf_mid_c + mtf_low_c;
-            eprintln!(
-                "  MTF+byte planes: high={} mid={} low={} total={} (savings: {} bytes, {:.1}%)",
-                mtf_high_c,
-                mtf_mid_c,
-                mtf_low_c,
-                mtf_planes_total,
-                repo_name_idx_bytes.len() as i64 - mtf_planes_total as i64,
-                100.0 * (1.0 - mtf_planes_total as f64 / repo_name_idx_bytes.len() as f64)
-            );
-
-            // Test varint encoding on MTF output
-            let mut mtf_varint = Vec::with_capacity(mtf_output.len() * 3);
-            for &v in &mtf_output {
-                // Simple varint: 7 bits per byte, high bit = continuation
-                let mut val = v;
-                loop {
-                    let byte = (val & 0x7F) as u8;
-                    val >>= 7;
-                    if val == 0 {
-                        mtf_varint.push(byte);
-                        break;
-                    } else {
-                        mtf_varint.push(byte | 0x80);
-                    }
-                }
-            }
-            let mtf_varint_c = zstd::encode_all(mtf_varint.as_slice(), ZSTD_LEVEL)
-                .unwrap()
-                .len();
-            eprintln!(
-                "  MTF+varint+zstd: raw={} compressed={} (savings: {} bytes, {:.1}%)",
-                mtf_varint.len(),
-                mtf_varint_c,
-                repo_name_idx_bytes.len() as i64 - mtf_varint_c as i64,
-                100.0 * (1.0 - mtf_varint_c as f64 / repo_name_idx_bytes.len() as f64)
-            );
         }
 
         let mut out = Vec::new();
@@ -1119,39 +1095,80 @@ impl EventCodec for XinyuzengCodec {
 
         let type_idx = unpack_bits_u32(&type_idx_raw, row_count)?;
 
-        // Decode MTF + byte planes for repo_name_idx
+        // Decode limited-alphabet MTF for repo_name_idx
         let repo_name_idx = {
-            if repo_name_idx_raw.len() < 12 {
+            if repo_name_idx_raw.len() < 32 {
                 return Err("repo_name_idx_raw too short".into());
             }
-            let max_idx = u32::from_le_bytes(repo_name_idx_raw[0..4].try_into()?);
-            let high_len = u32::from_le_bytes(repo_name_idx_raw[4..8].try_into()?) as usize;
-            let mid_len = u32::from_le_bytes(repo_name_idx_raw[8..12].try_into()?) as usize;
+            let mut hdr_pos = 0usize;
+            let top_k_len =
+                u32::from_le_bytes(repo_name_idx_raw[hdr_pos..hdr_pos + 4].try_into()?) as usize;
+            hdr_pos += 4;
+            let bitmap_len =
+                u32::from_le_bytes(repo_name_idx_raw[hdr_pos..hdr_pos + 4].try_into()?) as usize;
+            hdr_pos += 4;
+            let mtf_high_len =
+                u32::from_le_bytes(repo_name_idx_raw[hdr_pos..hdr_pos + 4].try_into()?) as usize;
+            hdr_pos += 4;
+            let mtf_mid_len =
+                u32::from_le_bytes(repo_name_idx_raw[hdr_pos..hdr_pos + 4].try_into()?) as usize;
+            hdr_pos += 4;
+            let mtf_low_len =
+                u32::from_le_bytes(repo_name_idx_raw[hdr_pos..hdr_pos + 4].try_into()?) as usize;
+            hdr_pos += 4;
+            let fallback_len =
+                u32::from_le_bytes(repo_name_idx_raw[hdr_pos..hdr_pos + 4].try_into()?) as usize;
+            hdr_pos += 4;
+            let mtf_count =
+                u32::from_le_bytes(repo_name_idx_raw[hdr_pos..hdr_pos + 4].try_into()?) as usize;
+            hdr_pos += 4;
+            let fallback_count =
+                u32::from_le_bytes(repo_name_idx_raw[hdr_pos..hdr_pos + 4].try_into()?) as usize;
+            hdr_pos += 4;
 
-            let high_start = 12;
-            let mid_start = high_start + high_len;
-            let low_start = mid_start + mid_len;
+            let top_k_start = hdr_pos;
+            let bitmap_start = top_k_start + top_k_len;
+            let mtf_high_start = bitmap_start + bitmap_len;
+            let mtf_mid_start = mtf_high_start + mtf_high_len;
+            let mtf_low_start = mtf_mid_start + mtf_mid_len;
+            let fallback_start = mtf_low_start + mtf_low_len;
 
-            let high_c = &repo_name_idx_raw[high_start..mid_start];
-            let mid_c = &repo_name_idx_raw[mid_start..low_start];
-            let low_c = &repo_name_idx_raw[low_start..];
+            // Decompress components
+            let top_k_indices = decode_u32_list(&zstd::decode_all(
+                &repo_name_idx_raw[top_k_start..bitmap_start],
+            )?)?;
+            let use_mtf_bitmap =
+                zstd::decode_all(&repo_name_idx_raw[bitmap_start..mtf_high_start])?;
 
-            // Decompress planes
-            let high_bytes = zstd::decode_all(high_c)?;
-            let mid_bytes = zstd::decode_all(mid_c)?;
-            let low_bytes = zstd::decode_all(low_c)?;
+            // Decompress MTF byte planes
+            let mtf_high = zstd::decode_all(&repo_name_idx_raw[mtf_high_start..mtf_mid_start])?;
+            let mtf_mid = zstd::decode_all(&repo_name_idx_raw[mtf_mid_start..mtf_low_start])?;
+            let mtf_low = zstd::decode_all(&repo_name_idx_raw[mtf_low_start..fallback_start])?;
 
-            // Reconstruct MTF values from planes
-            let mut mtf_values = Vec::with_capacity(row_count);
-            for i in 0..row_count {
-                let v = ((high_bytes[i] as u32) << 16)
-                    | ((mid_bytes[i] as u32) << 8)
-                    | (low_bytes[i] as u32);
+            // Reconstruct MTF values from byte planes
+            let mut mtf_values = Vec::with_capacity(mtf_count);
+            for i in 0..mtf_count {
+                let v =
+                    ((mtf_high[i] as u32) << 16) | ((mtf_mid[i] as u32) << 8) | (mtf_low[i] as u32);
                 mtf_values.push(v);
             }
 
-            // Reverse MTF transform
-            mtf_decode(&mtf_values, max_idx)
+            // Decompress fallback values
+            let fallback_values = unpack_bits_u32(
+                &zstd::decode_all(
+                    &repo_name_idx_raw[fallback_start..fallback_start + fallback_len],
+                )?,
+                fallback_count,
+            )?;
+
+            // Decode using limited MTF
+            limited_mtf_decode(
+                &top_k_indices,
+                &use_mtf_bitmap,
+                &mtf_values,
+                &fallback_values,
+                row_count,
+            )?
         };
 
         let dup_name_meta = decode_u32_list(&dup_name_meta_raw)?;
