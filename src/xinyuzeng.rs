@@ -21,12 +21,15 @@ use crate::{EventKey, EventValue, Repo};
 const MAGIC: &[u8; 4] = b"XYZ1";
 const ZSTD_LEVEL: i32 = 22;
 
-const COLUMN_NAMES: [&str; 8] = [
+const COLUMN_NAMES: [&str; 11] = [
     "type_dict",
     "repo_ids",
     "repo_names",
     "type_idx",
-    "repo_id_idx",
+    "repo_name_idx",
+    "dup_name_table",
+    "dup_row_bitmap",
+    "dup_variant_idx",
     "repo_name_variant_idx",
     "id_deltas",
     "ts_deltas",
@@ -143,6 +146,31 @@ fn pack_u32_le(values: &[u32]) -> Vec<u8> {
         buf.extend_from_slice(&v.to_le_bytes());
     }
     buf
+}
+
+fn encode_u32_list(values: &[u32]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + values.len() * 4);
+    write_u32(&mut buf, values.len() as u32);
+    for &v in values {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    buf
+}
+
+fn decode_u32_list(bytes: &[u8]) -> Result<Vec<u32>, Box<dyn Error>> {
+    let mut pos = 0;
+    let count = read_u32(bytes, &mut pos)? as usize;
+    if pos + count * 4 > bytes.len() {
+        return Err("u32 list overflow".into());
+    }
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut arr = [0u8; 4];
+        arr.copy_from_slice(&bytes[pos..pos + 4]);
+        pos += 4;
+        out.push(u32::from_le_bytes(arr));
+    }
+    Ok(out)
 }
 
 fn unpack_bits_u32(bytes: &[u8], count: usize) -> Result<Vec<u32>, Box<dyn Error>> {
@@ -316,6 +344,8 @@ impl StringDict {
 struct RepoDict {
     repo_ids: Vec<u64>,
     repo_names: Vec<Vec<String>>,
+    global_name_to_idx: HashMap<String, u32>,
+    global_names: Vec<String>,
     id_to_idx: HashMap<u64, u32>,
     name_to_idx: Vec<HashMap<String, u32>>,
 }
@@ -333,6 +363,7 @@ impl RepoDict {
         repo_ids.sort();
 
         let mut repo_names = Vec::with_capacity(repo_ids.len());
+        let mut global_names = Vec::new();
         let mut id_to_idx = HashMap::with_capacity(repo_ids.len());
         let mut name_to_idx = Vec::with_capacity(repo_ids.len());
 
@@ -348,14 +379,24 @@ impl RepoDict {
             let mut name_map = HashMap::new();
             for (j, name) in names.iter().enumerate() {
                 name_map.insert(name.clone(), j as u32);
+                global_names.push(name.clone());
             }
             repo_names.push(names);
             name_to_idx.push(name_map);
         }
 
+        global_names.sort();
+        global_names.dedup();
+        let mut global_name_to_idx = HashMap::with_capacity(global_names.len());
+        for (i, name) in global_names.iter().enumerate() {
+            global_name_to_idx.insert(name.clone(), i as u32);
+        }
+
         Self {
             repo_ids,
             repo_names,
+            global_name_to_idx,
+            global_names,
             id_to_idx,
             name_to_idx,
         }
@@ -426,18 +467,29 @@ impl RepoDict {
 
         let mut id_to_idx = HashMap::with_capacity(repo_ids.len());
         let mut name_to_idx = Vec::with_capacity(repo_ids.len());
+        let mut global_names = Vec::new();
         for (i, repo_id) in repo_ids.iter().enumerate() {
             id_to_idx.insert(*repo_id, i as u32);
             let mut name_map = HashMap::new();
             for (j, name) in repo_names[i].iter().enumerate() {
                 name_map.insert(name.clone(), j as u32);
+                global_names.push(name.clone());
             }
             name_to_idx.push(name_map);
+        }
+
+        global_names.sort();
+        global_names.dedup();
+        let mut global_name_to_idx = HashMap::with_capacity(global_names.len());
+        for (i, name) in global_names.iter().enumerate() {
+            global_name_to_idx.insert(name.clone(), i as u32);
         }
 
         Ok(Self {
             repo_ids,
             repo_names,
+            global_name_to_idx,
+            global_names,
             id_to_idx,
             name_to_idx,
         })
@@ -457,6 +509,14 @@ impl RepoDict {
 
     fn repo_name(&self, repo_id_idx: u32, name_idx: u32) -> &str {
         &self.repo_names[repo_id_idx as usize][name_idx as usize]
+    }
+
+    fn repo_name_global_index(&self, repo_name: &str) -> u32 {
+        self.global_name_to_idx[repo_name]
+    }
+
+    fn repo_name_from_global(&self, idx: u32) -> &str {
+        &self.global_names[idx as usize]
     }
 }
 
@@ -486,28 +546,90 @@ impl EventCodec for XinyuzengCodec {
             zstd::encode_all(repo_dict.encode_repo_names().as_slice(), ZSTD_LEVEL)?;
 
         let mut type_idx = Vec::with_capacity(sorted_events.len());
-        let mut repo_id_idx = Vec::with_capacity(sorted_events.len());
         let mut repo_name_variant_idx = Vec::with_capacity(sorted_events.len());
+        let mut repo_name_idx = Vec::with_capacity(sorted_events.len());
         let mut ids = Vec::with_capacity(sorted_events.len());
         let mut timestamps = Vec::with_capacity(sorted_events.len());
+
+        let mut name_id_sets: HashMap<u32, HashSet<u64>> = HashMap::new();
+        let mut name_id_order: HashMap<u32, Vec<u64>> = HashMap::new();
 
         for (key, value) in &sorted_events {
             type_idx.push(type_dict.get_index(&key.event_type));
             let id_idx = repo_dict.repo_id_index(value.repo.id);
-            repo_id_idx.push(id_idx);
             repo_name_variant_idx.push(repo_dict.repo_name_index(id_idx, &value.repo.name));
+
+            let name_idx = repo_dict.repo_name_global_index(&value.repo.name);
+            repo_name_idx.push(name_idx);
+            name_id_sets
+                .entry(name_idx)
+                .or_insert_with(HashSet::new)
+                .insert(value.repo.id);
+
             let event_id = key.id.parse::<u64>()?;
             ids.push(event_id);
             let ts = parse_timestamp(&value.created_at)?;
             timestamps.push(ts);
         }
 
+        for (name_idx, ids_set) in &name_id_sets {
+            if ids_set.len() > 1 {
+                let mut ids_vec: Vec<u64> = ids_set.iter().copied().collect();
+                ids_vec.sort();
+                name_id_order.insert(*name_idx, ids_vec);
+            }
+        }
+
+        let mut dup_name_entries: Vec<(u32, Vec<u64>)> = name_id_order
+            .into_iter()
+            .map(|(k, v)| (k, v))
+            .collect();
+        dup_name_entries.sort_by_key(|(k, _)| *k);
+
+        let mut dup_name_offsets: HashMap<u32, u32> = HashMap::new();
+        let mut dup_name_meta = Vec::new(); // [name_idx, count] pairs
+        let mut dup_name_ids = Vec::new(); // u32 hi/lo pairs
+        for (name_idx, ids_vec) in &dup_name_entries {
+            dup_name_offsets.insert(*name_idx, (dup_name_meta.len() / 2) as u32);
+            dup_name_meta.push(*name_idx);
+            dup_name_meta.push(ids_vec.len() as u32);
+            for id in ids_vec {
+                dup_name_ids.push((*id >> 32) as u32);
+                dup_name_ids.push(*id as u32);
+            }
+        }
+
+        let mut dup_row_bitmap = vec![0u8; (sorted_events.len() + 7) / 8];
+        let mut dup_variant_idx = Vec::new();
+
+        for (row, (_key, value)) in sorted_events.iter().enumerate() {
+            let name_idx = repo_dict.repo_name_global_index(&value.repo.name);
+            if let Some(offset) = dup_name_offsets.get(&name_idx) {
+                let byte = row / 8;
+                let bit = row % 8;
+                dup_row_bitmap[byte] |= 1 << bit;
+                let ids_vec = &dup_name_entries[*offset as usize].1;
+                let variant = ids_vec
+                    .iter()
+                    .position(|id| *id == value.repo.id)
+                    .unwrap_or(0) as u32;
+                dup_variant_idx.push(variant);
+            }
+        }
+
         let id_deltas = delta_encode_signed(&ids)?;
         let ts_deltas = delta_encode_signed(&timestamps)?;
 
         let type_idx_bytes = zstd::encode_all(pack_bits_u32(&type_idx).as_slice(), ZSTD_LEVEL)?;
-        let repo_id_idx_bytes =
-            zstd::encode_all(pack_u32_le(&repo_id_idx).as_slice(), ZSTD_LEVEL)?;
+        let repo_name_idx_bytes =
+            zstd::encode_all(pack_bits_u32(&repo_name_idx).as_slice(), ZSTD_LEVEL)?;
+        let dup_name_meta_bytes =
+            zstd::encode_all(encode_u32_list(&dup_name_meta).as_slice(), ZSTD_LEVEL)?;
+        let dup_name_ids_bytes =
+            zstd::encode_all(encode_u32_list(&dup_name_ids).as_slice(), ZSTD_LEVEL)?;
+        let dup_row_bitmap_bytes = zstd::encode_all(dup_row_bitmap.as_slice(), ZSTD_LEVEL)?;
+        let dup_variant_idx_bytes =
+            zstd::encode_all(encode_u32_list(&dup_variant_idx).as_slice(), ZSTD_LEVEL)?;
         let repo_name_variant_idx_bytes = zstd::encode_all(
             pack_bits_u32(&repo_name_variant_idx).as_slice(),
             ZSTD_LEVEL,
@@ -522,7 +644,10 @@ impl EventCodec for XinyuzengCodec {
                 repo_ids_bytes.len(),
                 repo_names_bytes.len(),
                 type_idx_bytes.len(),
-                repo_id_idx_bytes.len(),
+                repo_name_idx_bytes.len(),
+                dup_name_meta_bytes.len(),
+                dup_row_bitmap_bytes.len(),
+                dup_variant_idx_bytes.len(),
                 repo_name_variant_idx_bytes.len(),
                 id_deltas_bytes.len(),
                 ts_deltas_bytes.len(),
@@ -549,7 +674,11 @@ impl EventCodec for XinyuzengCodec {
         write_section(&mut out, &repo_ids_bytes);
         write_section(&mut out, &repo_names_bytes);
         write_section(&mut out, &type_idx_bytes);
-        write_section(&mut out, &repo_id_idx_bytes);
+        write_section(&mut out, &repo_name_idx_bytes);
+        write_section(&mut out, &dup_name_meta_bytes);
+        write_section(&mut out, &dup_name_ids_bytes);
+        write_section(&mut out, &dup_row_bitmap_bytes);
+        write_section(&mut out, &dup_variant_idx_bytes);
         write_section(&mut out, &repo_name_variant_idx_bytes);
         write_section(&mut out, &id_deltas_bytes);
         write_section(&mut out, &ts_deltas_bytes);
@@ -583,7 +712,11 @@ impl EventCodec for XinyuzengCodec {
         let repo_ids_raw = read_section(bytes, &mut pos)?;
         let repo_names_raw = read_section(bytes, &mut pos)?;
         let type_idx_raw = read_section(bytes, &mut pos)?;
-        let repo_id_idx_raw = read_section(bytes, &mut pos)?;
+        let repo_name_idx_raw = read_section(bytes, &mut pos)?;
+        let dup_name_meta_raw = read_section(bytes, &mut pos)?;
+        let dup_name_ids_raw = read_section(bytes, &mut pos)?;
+        let dup_row_bitmap_raw = read_section(bytes, &mut pos)?;
+        let dup_variant_idx_raw = read_section(bytes, &mut pos)?;
         let repo_name_variant_idx_raw = read_section(bytes, &mut pos)?;
         let id_deltas_raw = read_section(bytes, &mut pos)?;
         let ts_deltas_raw = read_section(bytes, &mut pos)?;
@@ -592,8 +725,12 @@ impl EventCodec for XinyuzengCodec {
         let repo_dict = RepoDict::decode(repo_count, &repo_ids_raw, &repo_names_raw)?;
 
         let type_idx = unpack_bits_u32(&type_idx_raw, row_count)?;
-        let repo_id_idx = unpack_u32_le(&repo_id_idx_raw, row_count)?;
-        let repo_name_variant_idx = unpack_bits_u32(&repo_name_variant_idx_raw, row_count)?;
+        let repo_name_idx = unpack_bits_u32(&repo_name_idx_raw, row_count)?;
+        let dup_name_meta = decode_u32_list(&dup_name_meta_raw)?;
+        let dup_name_ids = decode_u32_list(&dup_name_ids_raw)?;
+        let dup_row_bitmap = dup_row_bitmap_raw;
+        let dup_variant_idx = decode_u32_list(&dup_variant_idx_raw)?;
+        let _repo_name_variant_idx = unpack_bits_u32(&repo_name_variant_idx_raw, row_count)?;
         let id_deltas = unpack_bits_u64(&id_deltas_raw, row_count)?;
         let ts_deltas = unpack_bits_u64(&ts_deltas_raw, row_count)?;
 
@@ -604,11 +741,70 @@ impl EventCodec for XinyuzengCodec {
             return Err("row count mismatch".into());
         }
 
+        let mut dup_name_map: HashMap<u32, Vec<u64>> = HashMap::new();
+        let mut id_cursor = 0usize;
+        for chunk in dup_name_meta.chunks(2) {
+            if chunk.len() != 2 {
+                return Err("dup name meta mismatch".into());
+            }
+            let name_idx = chunk[0];
+            let count = chunk[1] as usize;
+            let mut ids_vec = Vec::with_capacity(count);
+            for _ in 0..count {
+                if id_cursor + 1 >= dup_name_ids.len() {
+                    return Err("dup name ids overflow".into());
+                }
+                let hi = dup_name_ids[id_cursor] as u64;
+                let lo = dup_name_ids[id_cursor + 1] as u64;
+                id_cursor += 2;
+                ids_vec.push((hi << 32) | lo);
+            }
+            dup_name_map.insert(name_idx, ids_vec);
+        }
+
+        let mut unique_name_to_repo_id: HashMap<u32, u64> = HashMap::new();
+        for (repo_id_idx, repo_id) in repo_dict.repo_ids.iter().enumerate() {
+            let names = &repo_dict.repo_names[repo_id_idx];
+            for name in names {
+                let name_idx = repo_dict.repo_name_global_index(name);
+                if !dup_name_map.contains_key(&name_idx) {
+                    unique_name_to_repo_id.insert(name_idx, *repo_id);
+                }
+            }
+        }
+
+        let mut dup_variant_cursor = 0usize;
         let mut events = Vec::with_capacity(row_count);
         for i in 0..row_count {
             let event_type = type_dict.get_string(type_idx[i]).to_string();
-            let repo_id = repo_dict.repo_id(repo_id_idx[i]);
-            let repo_name = repo_dict.repo_name(repo_id_idx[i], repo_name_variant_idx[i]);
+            let name_idx = repo_name_idx[i];
+            let repo_name = repo_dict.repo_name_from_global(name_idx);
+
+            let repo_id = if let Some(variants) = dup_name_map.get(&name_idx) {
+                let byte = i / 8;
+                let bit = i % 8;
+                if byte >= dup_row_bitmap.len() {
+                    return Err("dup row bitmap overflow".into());
+                }
+                let flagged = (dup_row_bitmap[byte] >> bit) & 1;
+                if flagged == 0 {
+                    return Err("dup row missing flag".into());
+                }
+                if dup_variant_cursor >= dup_variant_idx.len() {
+                    return Err("dup variant idx overflow".into());
+                }
+                let variant = dup_variant_idx[dup_variant_cursor] as usize;
+                dup_variant_cursor += 1;
+                if variant >= variants.len() {
+                    return Err("dup variant out of range".into());
+                }
+                variants[variant]
+            } else {
+                *unique_name_to_repo_id
+                    .get(&name_idx)
+                    .ok_or("missing unique repo id")?
+            };
+
             let repo_url = format!("https://api.github.com/repos/{}", repo_name);
             events.push((
                 EventKey {
