@@ -8,6 +8,7 @@
 //! - Global repo-name dictionary with per-repo index lists.
 //! - Owner/suffix split with owner dict + suffix bytes.
 //! - Reordering encode by repo-id blocks (blew up id/ts deltas).
+//! - Front-coded repo name dictionary.
 
 use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
@@ -19,7 +20,6 @@ use crate::{EventKey, EventValue, Repo};
 
 const MAGIC: &[u8; 4] = b"XYZ1";
 const ZSTD_LEVEL: i32 = 22;
-const ROW_GROUP_ROWS: usize = 128_000;
 
 const COLUMN_NAMES: [&str; 8] = [
     "type_dict",
@@ -143,20 +143,6 @@ fn pack_u32_le(values: &[u32]) -> Vec<u8> {
         buf.extend_from_slice(&v.to_le_bytes());
     }
     buf
-}
-
-fn row_groups(total_rows: usize, group_size: usize) -> Vec<(usize, usize)> {
-    if total_rows == 0 {
-        return Vec::new();
-    }
-    let mut groups = Vec::new();
-    let mut start = 0usize;
-    while start < total_rows {
-        let end = (start + group_size).min(total_rows);
-        groups.push((start, end));
-        start = end;
-    }
-    groups
 }
 
 fn unpack_bits_u32(bytes: &[u8], count: usize) -> Result<Vec<u32>, Box<dyn Error>> {
@@ -516,6 +502,9 @@ impl EventCodec for XinyuzengCodec {
             timestamps.push(ts);
         }
 
+        let id_deltas = delta_encode_signed(&ids)?;
+        let ts_deltas = delta_encode_signed(&timestamps)?;
+
         let type_idx_bytes = zstd::encode_all(pack_bits_u32(&type_idx).as_slice(), ZSTD_LEVEL)?;
         let repo_id_idx_bytes =
             zstd::encode_all(pack_u32_le(&repo_id_idx).as_slice(), ZSTD_LEVEL)?;
@@ -523,25 +512,8 @@ impl EventCodec for XinyuzengCodec {
             pack_bits_u32(&repo_name_variant_idx).as_slice(),
             ZSTD_LEVEL,
         )?;
-
-        let groups = row_groups(ids.len(), ROW_GROUP_ROWS);
-        let mut id_deltas_bytes_total = 0usize;
-        let mut ts_deltas_bytes_total = 0usize;
-
-        let mut group_bytes = Vec::with_capacity(groups.len());
-        for (start, end) in &groups {
-            let id_slice = &ids[*start..*end];
-            let ts_slice = &timestamps[*start..*end];
-            let id_deltas = delta_encode_signed(id_slice)?;
-            let ts_deltas = delta_encode_signed(ts_slice)?;
-
-            let id_bytes = zstd::encode_all(pack_bits_u64(&id_deltas).as_slice(), ZSTD_LEVEL)?;
-            let ts_bytes = zstd::encode_all(pack_bits_u64(&ts_deltas).as_slice(), ZSTD_LEVEL)?;
-
-            id_deltas_bytes_total += id_bytes.len();
-            ts_deltas_bytes_total += ts_bytes.len();
-            group_bytes.push((id_bytes, ts_bytes));
-        }
+        let id_deltas_bytes = zstd::encode_all(pack_bits_u64(&id_deltas).as_slice(), ZSTD_LEVEL)?;
+        let ts_deltas_bytes = zstd::encode_all(pack_bits_u64(&ts_deltas).as_slice(), ZSTD_LEVEL)?;
 
         let debug = debug_enabled();
         if debug {
@@ -552,8 +524,8 @@ impl EventCodec for XinyuzengCodec {
                 type_idx_bytes.len(),
                 repo_id_idx_bytes.len(),
                 repo_name_variant_idx_bytes.len(),
-                id_deltas_bytes_total,
-                ts_deltas_bytes_total,
+                id_deltas_bytes.len(),
+                ts_deltas_bytes.len(),
             ];
             let total: usize = sizes.iter().sum();
             for (name, size) in COLUMN_NAMES.iter().zip(sizes.iter()) {
@@ -579,16 +551,8 @@ impl EventCodec for XinyuzengCodec {
         write_section(&mut out, &type_idx_bytes);
         write_section(&mut out, &repo_id_idx_bytes);
         write_section(&mut out, &repo_name_variant_idx_bytes);
-
-        write_u32(&mut out, groups.len() as u32);
-        for ((start, end), (id_bytes, ts_bytes)) in groups.into_iter().zip(group_bytes.into_iter())
-        {
-            write_u32(&mut out, (end - start) as u32);
-            write_u32(&mut out, id_bytes.len() as u32);
-            out.extend_from_slice(&id_bytes);
-            write_u32(&mut out, ts_bytes.len() as u32);
-            out.extend_from_slice(&ts_bytes);
-        }
+        write_section(&mut out, &id_deltas_bytes);
+        write_section(&mut out, &ts_deltas_bytes);
 
         Ok(Bytes::from(out))
     }
@@ -621,7 +585,8 @@ impl EventCodec for XinyuzengCodec {
         let type_idx_raw = read_section(bytes, &mut pos)?;
         let repo_id_idx_raw = read_section(bytes, &mut pos)?;
         let repo_name_variant_idx_raw = read_section(bytes, &mut pos)?;
-        let group_count = read_u32(bytes, &mut pos)? as usize;
+        let id_deltas_raw = read_section(bytes, &mut pos)?;
+        let ts_deltas_raw = read_section(bytes, &mut pos)?;
 
         let type_dict = StringDict::decode(&type_dict_raw)?;
         let repo_dict = RepoDict::decode(repo_count, &repo_ids_raw, &repo_names_raw)?;
@@ -629,34 +594,11 @@ impl EventCodec for XinyuzengCodec {
         let type_idx = unpack_bits_u32(&type_idx_raw, row_count)?;
         let repo_id_idx = unpack_u32_le(&repo_id_idx_raw, row_count)?;
         let repo_name_variant_idx = unpack_bits_u32(&repo_name_variant_idx_raw, row_count)?;
-        let mut ids = Vec::with_capacity(row_count);
-        let mut timestamps = Vec::with_capacity(row_count);
+        let id_deltas = unpack_bits_u64(&id_deltas_raw, row_count)?;
+        let ts_deltas = unpack_bits_u64(&ts_deltas_raw, row_count)?;
 
-        for _ in 0..group_count {
-            let group_rows = read_u32(bytes, &mut pos)? as usize;
-            let id_len = read_u32(bytes, &mut pos)? as usize;
-            let id_end = pos + id_len;
-            if id_end > bytes.len() {
-                return Err("id group overflow".into());
-            }
-            let id_raw = zstd::decode_all(&bytes[pos..id_end])?;
-            pos = id_end;
-
-            let ts_len = read_u32(bytes, &mut pos)? as usize;
-            let ts_end = pos + ts_len;
-            if ts_end > bytes.len() {
-                return Err("ts group overflow".into());
-            }
-            let ts_raw = zstd::decode_all(&bytes[pos..ts_end])?;
-            pos = ts_end;
-
-            let id_deltas = unpack_bits_u64(&id_raw, group_rows)?;
-            let ts_deltas = unpack_bits_u64(&ts_raw, group_rows)?;
-            let mut id_vals = delta_decode_signed(&id_deltas)?;
-            let mut ts_vals = delta_decode_signed(&ts_deltas)?;
-            ids.append(&mut id_vals);
-            timestamps.append(&mut ts_vals);
-        }
+        let ids = delta_decode_signed(&id_deltas)?;
+        let timestamps = delta_decode_signed(&ts_deltas)?;
 
         if ids.len() != row_count || timestamps.len() != row_count {
             return Err("row count mismatch".into());
