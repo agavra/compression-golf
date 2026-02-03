@@ -463,8 +463,36 @@ impl RepoDict {
     }
 
     fn encode_repo_ids(&self) -> Vec<u8> {
-        let deltas = delta_encode_unsigned(&self.repo_ids);
-        pack_bits_u64(&deltas)
+        if self.repo_ids.is_empty() {
+            return Vec::new();
+        }
+
+        // Store base value (first repo_id) as 8 bytes
+        let base = self.repo_ids[0];
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&base.to_le_bytes());
+
+        // Compute deltas (all non-negative since sorted)
+        let deltas: Vec<u64> = self.repo_ids.windows(2).map(|w| w[1] - w[0]).collect();
+
+        // Split into 3 byte planes (max delta needs 19 bits = 3 bytes)
+        let count = deltas.len();
+        let mut low_bytes = Vec::with_capacity(count);
+        let mut mid_bytes = Vec::with_capacity(count);
+        let mut high_bytes = Vec::with_capacity(count);
+
+        for d in &deltas {
+            low_bytes.push(*d as u8);
+            mid_bytes.push((*d >> 8) as u8);
+            high_bytes.push((*d >> 16) as u8);
+        }
+
+        // Concatenate: high first (mostly zeros, compresses well), then mid, then low
+        buf.extend_from_slice(&high_bytes);
+        buf.extend_from_slice(&mid_bytes);
+        buf.extend_from_slice(&low_bytes);
+
+        buf
     }
 
     fn encode_repo_names(&self) -> Vec<u8> {
@@ -487,8 +515,34 @@ impl RepoDict {
         repo_ids_raw: &[u8],
         repo_names_raw: &[u8],
     ) -> Result<Self, Box<dyn Error>> {
-        let deltas = unpack_bits_u64(repo_ids_raw, repo_count)?;
-        let repo_ids = delta_decode_unsigned(&deltas);
+        // Decode repo_ids from byte planes format
+        let repo_ids = if repo_count == 0 {
+            Vec::new()
+        } else {
+            // Read base value (8 bytes)
+            let base = u64::from_le_bytes(repo_ids_raw[0..8].try_into()?);
+
+            // Remaining bytes are 3 byte planes
+            let delta_count = repo_count - 1;
+            let plane_size = delta_count;
+
+            let high_bytes = &repo_ids_raw[8..8 + plane_size];
+            let mid_bytes = &repo_ids_raw[8 + plane_size..8 + 2 * plane_size];
+            let low_bytes = &repo_ids_raw[8 + 2 * plane_size..8 + 3 * plane_size];
+
+            // Reconstruct repo_ids from deltas
+            let mut ids = Vec::with_capacity(repo_count);
+            ids.push(base);
+            let mut cur = base;
+            for i in 0..delta_count {
+                let delta = (high_bytes[i] as u64) << 16
+                    | (mid_bytes[i] as u64) << 8
+                    | (low_bytes[i] as u64);
+                cur += delta;
+                ids.push(cur);
+            }
+            ids
+        };
 
         let mut pos = 0;
         let names_repo_count = read_u32(repo_names_raw, &mut pos)? as usize;
