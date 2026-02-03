@@ -130,11 +130,34 @@ fn pack_bits_u32(values: &[u32]) -> Vec<u8> {
     pack_bits_u64(&tmp)
 }
 
+fn pack_u32_le(values: &[u32]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(values.len() * 4);
+    for &v in values {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    buf
+}
+
 fn unpack_bits_u32(bytes: &[u8], count: usize) -> Result<Vec<u32>, Box<dyn Error>> {
     Ok(unpack_bits_u64(bytes, count)?
         .into_iter()
         .map(|v| v as u32)
         .collect())
+}
+
+fn unpack_u32_le(bytes: &[u8], count: usize) -> Result<Vec<u32>, Box<dyn Error>> {
+    if bytes.len() < count * 4 {
+        return Err("u32 buffer too small".into());
+    }
+    let mut out = Vec::with_capacity(count);
+    let mut pos = 0;
+    for _ in 0..count {
+        let mut arr = [0u8; 4];
+        arr.copy_from_slice(&bytes[pos..pos + 4]);
+        pos += 4;
+        out.push(u32::from_le_bytes(arr));
+    }
+    Ok(out)
 }
 
 fn zigzag_encode(value: i64) -> u64 {
@@ -479,7 +502,7 @@ impl EventCodec for XinyuzengCodec {
 
         let type_idx_bytes = zstd::encode_all(pack_bits_u32(&type_idx).as_slice(), ZSTD_LEVEL)?;
         let repo_id_idx_bytes =
-            zstd::encode_all(pack_bits_u32(&repo_id_idx).as_slice(), ZSTD_LEVEL)?;
+            zstd::encode_all(pack_u32_le(&repo_id_idx).as_slice(), ZSTD_LEVEL)?;
         let repo_name_variant_idx_bytes = zstd::encode_all(
             pack_bits_u32(&repo_name_variant_idx).as_slice(),
             ZSTD_LEVEL,
@@ -564,7 +587,7 @@ impl EventCodec for XinyuzengCodec {
         let repo_dict = RepoDict::decode(repo_count, &repo_ids_raw, &repo_names_raw)?;
 
         let type_idx = unpack_bits_u32(&type_idx_raw, row_count)?;
-        let repo_id_idx = unpack_bits_u32(&repo_id_idx_raw, row_count)?;
+        let repo_id_idx = unpack_u32_le(&repo_id_idx_raw, row_count)?;
         let repo_name_variant_idx = unpack_bits_u32(&repo_name_variant_idx_raw, row_count)?;
         let id_deltas = unpack_bits_u64(&id_deltas_raw, row_count)?;
         let ts_deltas = unpack_bits_u64(&ts_deltas_raw, row_count)?;
