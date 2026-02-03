@@ -9,6 +9,13 @@
 //! - Remove zigzag for id_deltas: 6,214,202 → 6,098,398 bytes (-116KB, -1.9%)
 //!   id_deltas: 464,672 → 348,868 (-116KB). Since IDs are sorted, deltas are
 //!   always non-negative, so zigzag wastes 1 bit per value.
+//! - Byte plane splitting for repo_ids: 6,098,398 → 6,006,181 bytes (-92KB, -1.5%)
+//!   repo_ids: 487,627 → 395,410 (-92KB). Split 3-byte deltas into separate
+//!   high/mid/low streams for better zstd compression.
+//! - MTF + byte planes for repo_name_idx: 6,006,181 → 5,723,601 bytes (-283KB, -4.7%)
+//!   repo_name_idx: 2,232,905 → 1,950,325 (-283KB). Move-to-Front transform
+//!   exploits temporal locality, then byte planes help compress high bytes
+//!   (29% of MTF values < 256, 69% < 65536).
 //!
 //! Tried and reverted (worse sizes than current baseline):
 //! - Split repo_names into counts/lengths/bytes streams.
@@ -86,7 +93,7 @@ fn pack_bits_u64(values: &[u64]) -> Vec<u8> {
         64 - max_val.leading_zeros() as u8
     };
 
-    let mut buf = Vec::with_capacity((values.len() * bit_width as usize + 7) / 8 + 1);
+    let mut buf = Vec::with_capacity((values.len() * bit_width as usize).div_ceil(8) + 1);
     buf.push(bit_width);
 
     let mut bit_pos: usize = 0;
@@ -149,6 +156,7 @@ fn pack_bits_u32(values: &[u32]) -> Vec<u8> {
     pack_bits_u64(&tmp)
 }
 
+#[allow(dead_code)]
 fn pack_u32_le(values: &[u32]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(values.len() * 4);
     for &v in values {
@@ -189,6 +197,7 @@ fn unpack_bits_u32(bytes: &[u8], count: usize) -> Result<Vec<u32>, Box<dyn Error
         .collect())
 }
 
+#[allow(dead_code)]
 fn unpack_u32_le(bytes: &[u8], count: usize) -> Result<Vec<u32>, Box<dyn Error>> {
     if bytes.len() < count * 4 {
         return Err("u32 buffer too small".into());
@@ -249,6 +258,7 @@ fn delta_decode_signed(values: &[u64]) -> Result<Vec<u64>, Box<dyn Error>> {
 
 /// Encode values with base stored separately: returns (base, zigzag_deltas)
 /// This avoids the base value inflating the bit width for all deltas.
+#[allow(dead_code)]
 fn delta_encode_signed_split(values: &[u64]) -> Result<(u64, Vec<u64>), Box<dyn Error>> {
     if values.is_empty() {
         return Ok((0, Vec::new()));
@@ -265,6 +275,7 @@ fn delta_encode_signed_split(values: &[u64]) -> Result<(u64, Vec<u64>), Box<dyn 
 }
 
 /// Decode values from base + zigzag deltas
+#[allow(dead_code)]
 fn delta_decode_signed_split(base: u64, deltas: &[u64]) -> Result<Vec<u64>, Box<dyn Error>> {
     let mut out = Vec::with_capacity(deltas.len() + 1);
     out.push(base);
@@ -279,6 +290,7 @@ fn delta_decode_signed_split(base: u64, deltas: &[u64]) -> Result<Vec<u64>, Box<
     Ok(out)
 }
 
+#[allow(dead_code)]
 fn delta_encode_unsigned(values: &[u64]) -> Vec<u64> {
     if values.is_empty() {
         return Vec::new();
@@ -293,6 +305,7 @@ fn delta_encode_unsigned(values: &[u64]) -> Vec<u64> {
     out
 }
 
+#[allow(dead_code)]
 fn delta_decode_unsigned(values: &[u64]) -> Vec<u64> {
     if values.is_empty() {
         return Vec::new();
@@ -329,6 +342,50 @@ fn delta_decode_u8_split(base: u64, deltas: &[u8]) -> Vec<u64> {
         out.push(cur);
     }
     out
+}
+
+/// Move-to-Front encode: transforms values so recently-used get small indices.
+/// Exploits temporal locality - if the same value reappears soon, it gets a small index.
+fn mtf_encode(values: &[u32], max_val: u32) -> Vec<u32> {
+    let size = (max_val + 1) as usize;
+    let mut mtf_list: Vec<u32> = (0..size as u32).collect();
+    let mut positions: Vec<u32> = (0..size as u32).collect();
+    let mut output = Vec::with_capacity(values.len());
+
+    for &val in values {
+        let pos = positions[val as usize];
+        output.push(pos);
+        if pos > 0 {
+            // Shift elements and update positions
+            for i in (1..=pos as usize).rev() {
+                mtf_list[i] = mtf_list[i - 1];
+                positions[mtf_list[i] as usize] = i as u32;
+            }
+            mtf_list[0] = val;
+            positions[val as usize] = 0;
+        }
+    }
+    output
+}
+
+/// Move-to-Front decode: reverses MTF transform
+fn mtf_decode(values: &[u32], max_val: u32) -> Vec<u32> {
+    let size = (max_val + 1) as usize;
+    let mut mtf_list: Vec<u32> = (0..size as u32).collect();
+    let mut output = Vec::with_capacity(values.len());
+
+    for &pos in values {
+        let val = mtf_list[pos as usize];
+        output.push(val);
+        if pos > 0 {
+            // Shift elements
+            for i in (1..=pos as usize).rev() {
+                mtf_list[i] = mtf_list[i - 1];
+            }
+            mtf_list[0] = val;
+        }
+    }
+    output
 }
 
 struct StringDict {
@@ -406,6 +463,7 @@ impl StringDict {
     }
 }
 
+#[allow(dead_code)]
 struct RepoDict {
     repo_ids: Vec<u64>,
     repo_names: Vec<Vec<String>>,
@@ -420,7 +478,7 @@ impl RepoDict {
         let mut map: HashMap<u64, HashSet<String>> = HashMap::new();
         for (_, value) in events {
             map.entry(value.repo.id)
-                .or_insert_with(HashSet::new)
+                .or_default()
                 .insert(value.repo.name.clone());
         }
 
@@ -609,18 +667,22 @@ impl RepoDict {
         })
     }
 
+    #[allow(dead_code)]
     fn repo_id_index(&self, repo_id: u64) -> u32 {
         self.id_to_idx[&repo_id]
     }
 
+    #[allow(dead_code)]
     fn repo_name_index(&self, repo_id_idx: u32, repo_name: &str) -> u32 {
         self.name_to_idx[repo_id_idx as usize][repo_name]
     }
 
+    #[allow(dead_code)]
     fn repo_id(&self, idx: u32) -> u64 {
         self.repo_ids[idx as usize]
     }
 
+    #[allow(dead_code)]
     fn repo_name(&self, repo_id_idx: u32, name_idx: u32) -> &str {
         &self.repo_names[repo_id_idx as usize][name_idx as usize]
     }
@@ -673,7 +735,7 @@ impl EventCodec for XinyuzengCodec {
             repo_name_idx.push(name_idx);
             name_id_sets
                 .entry(name_idx)
-                .or_insert_with(HashSet::new)
+                .or_default()
                 .insert(value.repo.id);
 
             let event_id = key.id.parse::<u64>()?;
@@ -690,8 +752,7 @@ impl EventCodec for XinyuzengCodec {
             }
         }
 
-        let mut dup_name_entries: Vec<(u32, Vec<u64>)> =
-            name_id_order.into_iter().map(|(k, v)| (k, v)).collect();
+        let mut dup_name_entries: Vec<(u32, Vec<u64>)> = name_id_order.into_iter().collect();
         dup_name_entries.sort_by_key(|(k, _)| *k);
 
         let mut dup_name_offsets: HashMap<u32, u32> = HashMap::new();
@@ -707,7 +768,7 @@ impl EventCodec for XinyuzengCodec {
             }
         }
 
-        let mut dup_row_bitmap = vec![0u8; (sorted_events.len() + 7) / 8];
+        let mut dup_row_bitmap = vec![0u8; sorted_events.len().div_ceil(8)];
         let mut dup_variant_idx = Vec::new();
 
         for (row, (_key, value)) in sorted_events.iter().enumerate() {
@@ -731,8 +792,38 @@ impl EventCodec for XinyuzengCodec {
         let ts_deltas = delta_encode_signed(&timestamps)?;
 
         let type_idx_bytes = zstd::encode_all(pack_bits_u32(&type_idx).as_slice(), ZSTD_LEVEL)?;
-        let repo_name_idx_bytes =
-            zstd::encode_all(pack_bits_u32(&repo_name_idx).as_slice(), ZSTD_LEVEL)?;
+
+        // Apply MTF transform then byte plane splitting for repo_name_idx
+        let repo_name_idx_bytes = {
+            let max_idx = *repo_name_idx.iter().max().unwrap_or(&0);
+            let mtf = mtf_encode(&repo_name_idx, max_idx);
+
+            // Split into byte planes
+            let mut high_bytes = Vec::with_capacity(mtf.len());
+            let mut mid_bytes = Vec::with_capacity(mtf.len());
+            let mut low_bytes = Vec::with_capacity(mtf.len());
+            for &v in &mtf {
+                high_bytes.push((v >> 16) as u8);
+                mid_bytes.push((v >> 8) as u8);
+                low_bytes.push(v as u8);
+            }
+
+            // Compress each plane
+            let high_c = zstd::encode_all(high_bytes.as_slice(), ZSTD_LEVEL)?;
+            let mid_c = zstd::encode_all(mid_bytes.as_slice(), ZSTD_LEVEL)?;
+            let low_c = zstd::encode_all(low_bytes.as_slice(), ZSTD_LEVEL)?;
+
+            // Pack: [max_idx:u32][high_len:u32][mid_len:u32][high][mid][low]
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&max_idx.to_le_bytes());
+            buf.extend_from_slice(&(high_c.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&(mid_c.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&high_c);
+            buf.extend_from_slice(&mid_c);
+            buf.extend_from_slice(&low_c);
+            buf
+        };
+
         let dup_name_meta_bytes =
             zstd::encode_all(encode_u32_list(&dup_name_meta).as_slice(), ZSTD_LEVEL)?;
         let dup_name_ids_bytes =
@@ -767,6 +858,188 @@ impl EventCodec for XinyuzengCodec {
                 eprintln!("XINYU_DEBUG col {}: {}", name, size);
             }
             eprintln!("XINYU_DEBUG total bytes: {}", total);
+
+            // repo_name_idx detailed analysis
+            let max_idx = *repo_name_idx.iter().max().unwrap_or(&0);
+            let min_idx = *repo_name_idx.iter().min().unwrap_or(&0);
+            let bits_needed = if max_idx == 0 {
+                1
+            } else {
+                32 - max_idx.leading_zeros()
+            };
+
+            // Count runs (consecutive identical values)
+            let mut run_count = 1usize;
+            for w in repo_name_idx.windows(2) {
+                if w[0] != w[1] {
+                    run_count += 1;
+                }
+            }
+
+            // Unique values
+            let unique: HashSet<u32> = repo_name_idx.iter().copied().collect();
+
+            // Frequency distribution
+            let mut freq: HashMap<u32, usize> = HashMap::new();
+            for &idx in &repo_name_idx {
+                *freq.entry(idx).or_insert(0) += 1;
+            }
+            let mut freq_vec: Vec<_> = freq.into_iter().collect();
+            freq_vec.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+
+            // Test byte plane splitting
+            let mut high_bytes = Vec::with_capacity(repo_name_idx.len());
+            let mut mid_bytes = Vec::with_capacity(repo_name_idx.len());
+            let mut low_bytes = Vec::with_capacity(repo_name_idx.len());
+            for &v in &repo_name_idx {
+                high_bytes.push((v >> 16) as u8);
+                mid_bytes.push((v >> 8) as u8);
+                low_bytes.push(v as u8);
+            }
+            let high_compressed = zstd::encode_all(high_bytes.as_slice(), ZSTD_LEVEL)
+                .unwrap()
+                .len();
+            let mid_compressed = zstd::encode_all(mid_bytes.as_slice(), ZSTD_LEVEL)
+                .unwrap()
+                .len();
+            let low_compressed = zstd::encode_all(low_bytes.as_slice(), ZSTD_LEVEL)
+                .unwrap()
+                .len();
+            let planes_total = high_compressed + mid_compressed + low_compressed;
+
+            eprintln!("XINYU_DEBUG repo_name_idx analysis:");
+            eprintln!(
+                "  range: {} - {} ({} bits needed)",
+                min_idx, max_idx, bits_needed
+            );
+            eprintln!("  unique values: {}", unique.len());
+            eprintln!(
+                "  runs: {} (avg run len: {:.2})",
+                run_count,
+                repo_name_idx.len() as f64 / run_count as f64
+            );
+            eprintln!("  top 5 freq: {:?}", &freq_vec[..5.min(freq_vec.len())]);
+            eprintln!(
+                "  byte planes: high={} mid={} low={} total={}",
+                high_compressed, mid_compressed, low_compressed, planes_total
+            );
+            eprintln!("  current (bitpack+zstd): {}", repo_name_idx_bytes.len());
+            eprintln!(
+                "  byte planes savings: {} bytes ({:.1}%)",
+                repo_name_idx_bytes.len() as i64 - planes_total as i64,
+                100.0 * (1.0 - planes_total as f64 / repo_name_idx_bytes.len() as f64)
+            );
+
+            // Test frequency-based reordering
+            // Assign lowest indices to most frequent repos
+            let mut idx_remap: HashMap<u32, u32> = HashMap::new();
+            for (new_idx, (old_idx, _)) in freq_vec.iter().enumerate() {
+                idx_remap.insert(*old_idx, new_idx as u32);
+            }
+            let freq_reordered: Vec<u32> = repo_name_idx.iter().map(|&v| idx_remap[&v]).collect();
+            let freq_reordered_bytes =
+                zstd::encode_all(pack_bits_u32(&freq_reordered).as_slice(), ZSTD_LEVEL)
+                    .unwrap()
+                    .len();
+            eprintln!(
+                "  freq-reorder (bitpack+zstd): {} (savings: {} bytes, {:.1}%)",
+                freq_reordered_bytes,
+                repo_name_idx_bytes.len() as i64 - freq_reordered_bytes as i64,
+                100.0 * (1.0 - freq_reordered_bytes as f64 / repo_name_idx_bytes.len() as f64)
+            );
+
+            // Test Move-to-Front transform
+            // Recently used indices get small numbers
+            let mut mtf_list: Vec<u32> = (0..=max_idx).collect();
+            let mut mtf_positions: Vec<u32> = (0..=max_idx).collect(); // inverse: mtf_positions[val] = position in mtf_list
+            let mut mtf_output: Vec<u32> = Vec::with_capacity(repo_name_idx.len());
+            for &val in &repo_name_idx {
+                let pos = mtf_positions[val as usize];
+                mtf_output.push(pos);
+                // Move val to front
+                if pos > 0 {
+                    for i in (1..=pos as usize).rev() {
+                        mtf_list[i] = mtf_list[i - 1];
+                        mtf_positions[mtf_list[i] as usize] = i as u32;
+                    }
+                    mtf_list[0] = val;
+                    mtf_positions[val as usize] = 0;
+                }
+            }
+            let mtf_bytes = zstd::encode_all(pack_bits_u32(&mtf_output).as_slice(), ZSTD_LEVEL)
+                .unwrap()
+                .len();
+            let mtf_max = *mtf_output.iter().max().unwrap_or(&0);
+            let mtf_under_256 = mtf_output.iter().filter(|&&v| v < 256).count();
+            let mtf_under_65536 = mtf_output.iter().filter(|&&v| v < 65536).count();
+            eprintln!(
+                "  MTF (bitpack+zstd): {} (savings: {} bytes, {:.1}%)",
+                mtf_bytes,
+                repo_name_idx_bytes.len() as i64 - mtf_bytes as i64,
+                100.0 * (1.0 - mtf_bytes as f64 / repo_name_idx_bytes.len() as f64)
+            );
+            eprintln!(
+                "  MTF stats: max={} under256={:.1}% under65536={:.1}%",
+                mtf_max,
+                100.0 * mtf_under_256 as f64 / repo_name_idx.len() as f64,
+                100.0 * mtf_under_65536 as f64 / repo_name_idx.len() as f64
+            );
+
+            // Test MTF + byte planes
+            let mut mtf_high = Vec::with_capacity(mtf_output.len());
+            let mut mtf_mid = Vec::with_capacity(mtf_output.len());
+            let mut mtf_low = Vec::with_capacity(mtf_output.len());
+            for &v in &mtf_output {
+                mtf_high.push((v >> 16) as u8);
+                mtf_mid.push((v >> 8) as u8);
+                mtf_low.push(v as u8);
+            }
+            let mtf_high_c = zstd::encode_all(mtf_high.as_slice(), ZSTD_LEVEL)
+                .unwrap()
+                .len();
+            let mtf_mid_c = zstd::encode_all(mtf_mid.as_slice(), ZSTD_LEVEL)
+                .unwrap()
+                .len();
+            let mtf_low_c = zstd::encode_all(mtf_low.as_slice(), ZSTD_LEVEL)
+                .unwrap()
+                .len();
+            let mtf_planes_total = mtf_high_c + mtf_mid_c + mtf_low_c;
+            eprintln!(
+                "  MTF+byte planes: high={} mid={} low={} total={} (savings: {} bytes, {:.1}%)",
+                mtf_high_c,
+                mtf_mid_c,
+                mtf_low_c,
+                mtf_planes_total,
+                repo_name_idx_bytes.len() as i64 - mtf_planes_total as i64,
+                100.0 * (1.0 - mtf_planes_total as f64 / repo_name_idx_bytes.len() as f64)
+            );
+
+            // Test varint encoding on MTF output
+            let mut mtf_varint = Vec::with_capacity(mtf_output.len() * 3);
+            for &v in &mtf_output {
+                // Simple varint: 7 bits per byte, high bit = continuation
+                let mut val = v;
+                loop {
+                    let byte = (val & 0x7F) as u8;
+                    val >>= 7;
+                    if val == 0 {
+                        mtf_varint.push(byte);
+                        break;
+                    } else {
+                        mtf_varint.push(byte | 0x80);
+                    }
+                }
+            }
+            let mtf_varint_c = zstd::encode_all(mtf_varint.as_slice(), ZSTD_LEVEL)
+                .unwrap()
+                .len();
+            eprintln!(
+                "  MTF+varint+zstd: raw={} compressed={} (savings: {} bytes, {:.1}%)",
+                mtf_varint.len(),
+                mtf_varint_c,
+                repo_name_idx_bytes.len() as i64 - mtf_varint_c as i64,
+                100.0 * (1.0 - mtf_varint_c as f64 / repo_name_idx_bytes.len() as f64)
+            );
         }
 
         let mut out = Vec::new();
@@ -817,11 +1090,23 @@ impl EventCodec for XinyuzengCodec {
             Ok(zstd::decode_all(compressed)?)
         };
 
+        // For sections that handle their own compression (like repo_name_idx with MTF+byte planes)
+        let read_section_raw = |bytes: &[u8], pos: &mut usize| -> Result<Vec<u8>, Box<dyn Error>> {
+            let len = read_u32(bytes, pos)? as usize;
+            let end = *pos + len;
+            if end > bytes.len() {
+                return Err("section overflow".into());
+            }
+            let raw = &bytes[*pos..end];
+            *pos = end;
+            Ok(raw.to_vec())
+        };
+
         let type_dict_raw = read_section(bytes, &mut pos)?;
-        let repo_ids_raw = read_section(bytes, &mut pos)?;
+        let repo_ids_raw = read_section(bytes, &mut pos)?; // zstd-compressed byte planes
         let repo_names_raw = read_section(bytes, &mut pos)?;
         let type_idx_raw = read_section(bytes, &mut pos)?;
-        let repo_name_idx_raw = read_section(bytes, &mut pos)?;
+        let repo_name_idx_raw = read_section_raw(bytes, &mut pos)?; // MTF + byte planes, handles own compression
         let dup_name_meta_raw = read_section(bytes, &mut pos)?;
         let dup_name_ids_raw = read_section(bytes, &mut pos)?;
         let dup_row_bitmap_raw = read_section(bytes, &mut pos)?;
@@ -833,7 +1118,42 @@ impl EventCodec for XinyuzengCodec {
         let repo_dict = RepoDict::decode(repo_count, &repo_ids_raw, &repo_names_raw)?;
 
         let type_idx = unpack_bits_u32(&type_idx_raw, row_count)?;
-        let repo_name_idx = unpack_bits_u32(&repo_name_idx_raw, row_count)?;
+
+        // Decode MTF + byte planes for repo_name_idx
+        let repo_name_idx = {
+            if repo_name_idx_raw.len() < 12 {
+                return Err("repo_name_idx_raw too short".into());
+            }
+            let max_idx = u32::from_le_bytes(repo_name_idx_raw[0..4].try_into()?);
+            let high_len = u32::from_le_bytes(repo_name_idx_raw[4..8].try_into()?) as usize;
+            let mid_len = u32::from_le_bytes(repo_name_idx_raw[8..12].try_into()?) as usize;
+
+            let high_start = 12;
+            let mid_start = high_start + high_len;
+            let low_start = mid_start + mid_len;
+
+            let high_c = &repo_name_idx_raw[high_start..mid_start];
+            let mid_c = &repo_name_idx_raw[mid_start..low_start];
+            let low_c = &repo_name_idx_raw[low_start..];
+
+            // Decompress planes
+            let high_bytes = zstd::decode_all(high_c)?;
+            let mid_bytes = zstd::decode_all(mid_c)?;
+            let low_bytes = zstd::decode_all(low_c)?;
+
+            // Reconstruct MTF values from planes
+            let mut mtf_values = Vec::with_capacity(row_count);
+            for i in 0..row_count {
+                let v = ((high_bytes[i] as u32) << 16)
+                    | ((mid_bytes[i] as u32) << 8)
+                    | (low_bytes[i] as u32);
+                mtf_values.push(v);
+            }
+
+            // Reverse MTF transform
+            mtf_decode(&mtf_values, max_idx)
+        };
+
         let dup_name_meta = decode_u32_list(&dup_name_meta_raw)?;
         let dup_name_ids = decode_u32_list(&dup_name_ids_raw)?;
         let dup_row_bitmap = dup_row_bitmap_raw;
