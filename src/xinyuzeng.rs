@@ -30,6 +30,12 @@
 //! - Delta+bitpack dup_name_meta/dup_name_ids (6,284,344 bytes).
 //! - Split base from ts_deltas (+728 bytes, zstd already handles it well).
 //! - Entropy coding (Huffman/FSE) for id_deltas: zstd already achieves near-optimal.
+//! - repo_id_idx per row replacing repo_names + dup columns: +1.7MB worse due to
+//!   needing both global_names (2.4MB) and repo_id_idx (2.1MB) vs repo_names (2.7MB).
+//! - Front-coded global names + name→repo mapping: +305KB worse (mapping overhead
+//!   676KB outweighs front-coding savings 371KB).
+//! - repo_name_idx - repo_id_idx difference encoding: correlation too weak (±262K range),
+//!   zigzag+compress gives worse results than direct encoding.
 
 use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};

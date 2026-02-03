@@ -26,10 +26,12 @@
 - Commit messages are short and descriptive (e.g., `Add fulmicoton codec`).
 - PRs should add a single file `src/<your-github-username>.rs` and the minimal `src/main.rs` import/wiring.
 - Include the resulting compressed size in the PR description.
+- Before committing, ensure there are no clippy warnings by running `cargo clippy --release -- -D warnings`.
 
 ## Agent-Specific Instructions
 - When iterating on or optimizing a codec, continuously monitor compression ratios in detail (e.g., total size and per-column sizes if your format tracks them) to validate whether changes improve results.
 - Prefer small, incremental changes and re-run `cargo run --release -- --codec <name>` after each change to confirm impact.
 - For `xinyuzeng`, always run `cargo run --release -- --codec xinyuzeng` after each change and include the latest size in the commit message.
 - When determining prior `xinyuzeng` sizes for comparison, check the git log entries for recent size-tagged commits.
+- Record every unsuccessful edit effort in the top comment of `src/xinyuzeng.rs`.
 - Before proposing aggressive codec changes, add debug samples and distribution stats for the largest columns (currently `repo_id_idx` and `repo_names`) and use those diagnostics to guide strategy selection.
