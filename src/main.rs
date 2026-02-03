@@ -14,6 +14,7 @@ mod natebrennand;
 mod samsond;
 mod xiangpenghao;
 mod zstd;
+mod kjcao;
 
 use agavra::AgavraCodec;
 use codec::EventCodec;
@@ -25,6 +26,7 @@ use natebrennand::NatebrennandCodec;
 use samsond::SamsondCodec;
 use xiangpenghao::XiangpengHaoCodec;
 use zstd::ZstdCodec;
+use kjcao::KjcaoCodec;
 
 use crate::fulmicoton::FulmicotonCodec;
 
@@ -198,6 +200,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         (Box::new(JakedgyCodec::new()), &sorted_events),
         (Box::new(NatebrennandCodec::new()), &sorted_events),
         (Box::new(FulmicotonCodec), &sorted_events),
+        (Box::new(KjcaoCodec::new()), &sorted_events),
     ];
 
     for (codec, expected) in codecs {
