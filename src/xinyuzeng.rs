@@ -1,7 +1,7 @@
 //! # Xinyuzeng Codec
 //!
-//! Columnar layout with dictionary-encoded repo data, delta-encoded ids/timestamps,
-//! and per-column zstd compression.
+//! Columnar layout with dictionary-encoded repos, limited-alphabet MTF for indices,
+//! byte-plane splitting, delta encoding for IDs/timestamps, and per-column zstd compression.
 //!
 //! Successful optimizations:
 //! - Split base from id_deltas: 6,283,516 → 6,214,202 bytes (-69KB, -1.1%)
