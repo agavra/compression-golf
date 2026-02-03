@@ -9,26 +9,26 @@ mod fabinout;
 mod fulmicoton;
 mod hachikuji;
 mod jakedgy;
+mod kjcao;
 mod naive;
 mod natebrennand;
 mod samsond;
 mod xiangpenghao;
 mod xinyuzeng;
 mod zstd;
-mod kjcao;
 
 use agavra::AgavraCodec;
 use codec::EventCodec;
 use fabinout::FabinoutCodec;
 use hachikuji::HachikujiCodec;
 use jakedgy::JakedgyCodec;
+use kjcao::KjcaoCodec;
 use naive::NaiveCodec;
 use natebrennand::NatebrennandCodec;
 use samsond::SamsondCodec;
 use xiangpenghao::XiangpengHaoCodec;
 use xinyuzeng::XinyuzengCodec;
 use zstd::ZstdCodec;
-use kjcao::KjcaoCodec;
 
 use crate::fulmicoton::FulmicotonCodec;
 

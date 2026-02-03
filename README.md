@@ -1,6 +1,6 @@
 # compression-golf
 
-**Can you beat 5,677,291 bytes?**
+**Can you beat 5,188,464 bytes?**
 
 A compression challenge: encode 1,000,000 GitHub events into the smallest possible binary format.
 
@@ -14,16 +14,18 @@ This leaderboard uses the `data.json.gz` dataset included in the repo. Use this 
 
 | Rank | Who                                | Size (Bytes) |
 |------|------------------------------------|--------------|
-| 1    | [fulmicoton](src/fulmicoton.rs)    | 5,677,291    |
-| 2    | [natebrennand](src/natebrennand.rs)| 5,996,236    |
-| 3    | [jakedgy](src/jakedgy.rs)          | 6,402,499    |
-| 4    | [hachikuji](src/hachikuji.rs)      | 6,524,516    |
-| 5    | [XiangpengHao](src/xiangpenghao.rs)| 6,847,283    |
-| 6    | [agavra](src/agavra.rs)            | 7,273,680    |
-| 7    | [fabinout](src/fabinout.rs)        | 7,283,778    |
-| 8    | [samsond](src/samsond.rs)          | 7,564,554    |
-| 9    | *[Zstd(22)](src/zstd.rs)*          | 11,917,798   |
-| 10   | *[Zstd(9)](src/zstd.rs)*           | 17,869,403   |
+| 1    | [kjcao](src/kjcao.rs)              | 5,188,464    |
+| 2    | [fulmicoton](src/fulmicoton.rs)    | 5,677,291    |
+| 3    | [xinyuzeng](src/xinyuzeng.rs)      | 5,784,827    |
+| 4    | [natebrennand](src/natebrennand.rs)| 5,996,236    |
+| 5    | [jakedgy](src/jakedgy.rs)          | 6,402,499    |
+| 6    | [hachikuji](src/hachikuji.rs)      | 6,524,516    |
+| 7    | [XiangpengHao](src/xiangpenghao.rs)| 6,847,283    |
+| 8    | [agavra](src/agavra.rs)            | 7,273,680    |
+| 9    | [fabinout](src/fabinout.rs)        | 7,283,778    |
+| 10   | [samsond](src/samsond.rs)          | 7,564,554    |
+| 11   | *[Zstd(22)](src/zstd.rs)*          | 11,917,798   |
+| 12   | *[Zstd(9)](src/zstd.rs)*           | 17,869,403   |
 |      | *[Naive (baseline)](src/naive.rs)* | 210,727,389  |
 
 ### Evaluation Dataset Leaderboard
