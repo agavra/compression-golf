@@ -2,6 +2,12 @@
 //!
 //! Columnar layout with dictionary-encoded repo data, delta-encoded ids/timestamps,
 //! and per-column zstd compression.
+//!
+//! Tried and reverted (worse sizes than current baseline):
+//! - Split repo_names into counts/lengths/bytes streams.
+//! - Global repo-name dictionary with per-repo index lists.
+//! - Owner/suffix split with owner dict + suffix bytes.
+//! - Reordering encode by repo-id blocks (blew up id/ts deltas).
 
 use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
