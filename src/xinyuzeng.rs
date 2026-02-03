@@ -373,12 +373,8 @@ impl RepoDict {
         }
         for names in &self.repo_names {
             for name in names {
-                write_u32(&mut buf, name.len() as u32);
-            }
-        }
-        for names in &self.repo_names {
-            for name in names {
                 buf.extend_from_slice(name.as_bytes());
+                buf.push(0);
             }
         }
         buf
@@ -402,27 +398,29 @@ impl RepoDict {
             name_counts.push(read_u32(repo_names_raw, &mut pos)? as usize);
         }
 
-        let mut name_lengths = Vec::with_capacity(repo_count);
-        for &count in &name_counts {
-            let mut lens = Vec::with_capacity(count);
-            for _ in 0..count {
-                lens.push(read_u32(repo_names_raw, &mut pos)? as usize);
-            }
-            name_lengths.push(lens);
-        }
-
         let mut repo_names = Vec::with_capacity(repo_count);
-        for lens in name_lengths {
-            let mut names = Vec::with_capacity(lens.len());
-            for len in lens {
-                if pos + len > repo_names_raw.len() {
+        let mut cursor = pos;
+        for &count in &name_counts {
+            let mut names = Vec::with_capacity(count);
+            for _ in 0..count {
+                if cursor >= repo_names_raw.len() {
                     return Err("repo names overflow".into());
                 }
-                let s = std::str::from_utf8(&repo_names_raw[pos..pos + len])?.to_string();
-                pos += len;
+                let start = cursor;
+                while cursor < repo_names_raw.len() && repo_names_raw[cursor] != 0 {
+                    cursor += 1;
+                }
+                if cursor >= repo_names_raw.len() {
+                    return Err("repo names missing delimiter".into());
+                }
+                let s = std::str::from_utf8(&repo_names_raw[start..cursor])?.to_string();
+                cursor += 1; // skip delimiter
                 names.push(s);
             }
             repo_names.push(names);
+        }
+        if cursor != repo_names_raw.len() {
+            return Err("repo names trailing bytes".into());
         }
 
         let mut id_to_idx = HashMap::with_capacity(repo_ids.len());
