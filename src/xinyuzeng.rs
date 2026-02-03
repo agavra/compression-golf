@@ -3,12 +3,18 @@
 //! Columnar layout with dictionary-encoded repo data, delta-encoded ids/timestamps,
 //! and per-column zstd compression.
 //!
+//! Successful optimizations:
+//! - Split base from id_deltas: 6,283,516 → 6,214,202 bytes (-69KB, -1.1%)
+//!   id_deltas: 533,986 → 464,672 (-69KB)
+//!
 //! Tried and reverted (worse sizes than current baseline):
 //! - Split repo_names into counts/lengths/bytes streams.
 //! - Global repo-name dictionary with per-repo index lists.
 //! - Owner/suffix split with owner dict + suffix bytes.
 //! - Reordering encode by repo-id blocks (blew up id/ts deltas).
 //! - Front-coded repo name dictionary.
+//! - Delta+bitpack dup_name_meta/dup_name_ids (6,284,344 bytes).
+//! - Split base from ts_deltas (+728 bytes, zstd already handles it well).
 
 use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
@@ -237,6 +243,38 @@ fn delta_decode_signed(values: &[u64]) -> Result<Vec<u64>, Box<dyn Error>> {
     Ok(out)
 }
 
+/// Encode values with base stored separately: returns (base, zigzag_deltas)
+/// This avoids the base value inflating the bit width for all deltas.
+fn delta_encode_signed_split(values: &[u64]) -> Result<(u64, Vec<u64>), Box<dyn Error>> {
+    if values.is_empty() {
+        return Ok((0, Vec::new()));
+    }
+    let base = values[0];
+    let mut deltas = Vec::with_capacity(values.len().saturating_sub(1));
+    let mut prev = i64::try_from(base)?;
+    for &v in values.iter().skip(1) {
+        let cur = i64::try_from(v)?;
+        deltas.push(zigzag_encode(cur - prev));
+        prev = cur;
+    }
+    Ok((base, deltas))
+}
+
+/// Decode values from base + zigzag deltas
+fn delta_decode_signed_split(base: u64, deltas: &[u64]) -> Result<Vec<u64>, Box<dyn Error>> {
+    let mut out = Vec::with_capacity(deltas.len() + 1);
+    out.push(base);
+    let mut cur = i64::try_from(base)?;
+    for &d in deltas {
+        cur += zigzag_decode(d);
+        if cur < 0 {
+            return Err("negative value".into());
+        }
+        out.push(cur as u64);
+    }
+    Ok(out)
+}
+
 fn delta_encode_unsigned(values: &[u64]) -> Vec<u64> {
     if values.is_empty() {
         return Vec::new();
@@ -368,12 +406,7 @@ impl RepoDict {
 
         for (i, repo_id) in repo_ids.iter().enumerate() {
             id_to_idx.insert(*repo_id, i as u32);
-            let mut names: Vec<String> = map
-                .get(repo_id)
-                .unwrap()
-                .iter()
-                .cloned()
-                .collect();
+            let mut names: Vec<String> = map.get(repo_id).unwrap().iter().cloned().collect();
             names.sort();
             let mut name_map = HashMap::new();
             for (j, name) in names.iter().enumerate() {
@@ -575,10 +608,8 @@ impl EventCodec for XinyuzengCodec {
             }
         }
 
-        let mut dup_name_entries: Vec<(u32, Vec<u64>)> = name_id_order
-            .into_iter()
-            .map(|(k, v)| (k, v))
-            .collect();
+        let mut dup_name_entries: Vec<(u32, Vec<u64>)> =
+            name_id_order.into_iter().map(|(k, v)| (k, v)).collect();
         dup_name_entries.sort_by_key(|(k, _)| *k);
 
         let mut dup_name_offsets: HashMap<u32, u32> = HashMap::new();
@@ -612,7 +643,8 @@ impl EventCodec for XinyuzengCodec {
             }
         }
 
-        let id_deltas = delta_encode_signed(&ids)?;
+        // Split base from deltas to avoid base inflating bit width for all values
+        let (id_base, id_deltas) = delta_encode_signed_split(&ids)?;
         let ts_deltas = delta_encode_signed(&timestamps)?;
 
         let type_idx_bytes = zstd::encode_all(pack_bits_u32(&type_idx).as_slice(), ZSTD_LEVEL)?;
@@ -625,7 +657,12 @@ impl EventCodec for XinyuzengCodec {
         let dup_row_bitmap_bytes = zstd::encode_all(dup_row_bitmap.as_slice(), ZSTD_LEVEL)?;
         let dup_variant_idx_bytes =
             zstd::encode_all(encode_u32_list(&dup_variant_idx).as_slice(), ZSTD_LEVEL)?;
-        let id_deltas_bytes = zstd::encode_all(pack_bits_u64(&id_deltas).as_slice(), ZSTD_LEVEL)?;
+
+        // Pack base value (8 bytes) followed by bitpacked deltas for id_deltas
+        let mut id_raw = id_base.to_le_bytes().to_vec();
+        id_raw.extend_from_slice(&pack_bits_u64(&id_deltas));
+        let id_deltas_bytes = zstd::encode_all(id_raw.as_slice(), ZSTD_LEVEL)?;
+
         let ts_deltas_bytes = zstd::encode_all(pack_bits_u64(&ts_deltas).as_slice(), ZSTD_LEVEL)?;
 
         let debug = debug_enabled();
@@ -718,10 +755,16 @@ impl EventCodec for XinyuzengCodec {
         let dup_name_ids = decode_u32_list(&dup_name_ids_raw)?;
         let dup_row_bitmap = dup_row_bitmap_raw;
         let dup_variant_idx = decode_u32_list(&dup_variant_idx_raw)?;
-        let id_deltas = unpack_bits_u64(&id_deltas_raw, row_count)?;
-        let ts_deltas = unpack_bits_u64(&ts_deltas_raw, row_count)?;
 
-        let ids = delta_decode_signed(&id_deltas)?;
+        // Read base (8 bytes) then unpack deltas for id_deltas
+        if id_deltas_raw.len() < 8 {
+            return Err("id_deltas too short".into());
+        }
+        let id_base = u64::from_le_bytes(id_deltas_raw[0..8].try_into().unwrap());
+        let id_deltas = unpack_bits_u64(&id_deltas_raw[8..], row_count.saturating_sub(1))?;
+        let ids = delta_decode_signed_split(id_base, &id_deltas)?;
+
+        let ts_deltas = unpack_bits_u64(&ts_deltas_raw, row_count)?;
         let timestamps = delta_decode_signed(&ts_deltas)?;
 
         if ids.len() != row_count || timestamps.len() != row_count {
