@@ -330,28 +330,65 @@ fn delta_decode_unsigned(values: &[u64]) -> Vec<u64> {
     out
 }
 
-/// Encode unsigned deltas with base stored separately, returning raw bytes.
-/// Since IDs are sorted, all deltas are non-negative and fit in u8 (max 251).
-/// This avoids the wasteful zigzag transform that doubles positive values.
-fn delta_encode_u8_split(values: &[u64]) -> (u64, Vec<u8>) {
+/// Encode unsigned deltas with base stored separately, using varint encoding.
+/// Since IDs are sorted, all deltas are non-negative.
+/// Uses varint (LEB128-style) to handle variable delta sizes efficiently.
+fn delta_encode_varint_split(values: &[u64]) -> (u64, Vec<u8>) {
     if values.is_empty() {
         return (0, Vec::new());
     }
     let base = values[0];
-    let deltas: Vec<u8> = values.windows(2).map(|w| (w[1] - w[0]) as u8).collect();
-    (base, deltas)
+    let mut buf = Vec::with_capacity(values.len() * 2); // estimate
+    for w in values.windows(2) {
+        let mut d = w[1] - w[0];
+        // Encode as varint (LEB128 unsigned)
+        loop {
+            let byte = (d & 0x7F) as u8;
+            d >>= 7;
+            if d == 0 {
+                buf.push(byte);
+                break;
+            } else {
+                buf.push(byte | 0x80);
+            }
+        }
+    }
+    (base, buf)
 }
 
-/// Decode values from base + raw u8 deltas
-fn delta_decode_u8_split(base: u64, deltas: &[u8]) -> Vec<u64> {
-    let mut out = Vec::with_capacity(deltas.len() + 1);
+/// Decode values from base + varint deltas
+fn delta_decode_varint_split(
+    base: u64,
+    deltas: &[u8],
+    count: usize,
+) -> Result<Vec<u64>, Box<dyn Error>> {
+    let mut out = Vec::with_capacity(count);
     out.push(base);
     let mut cur = base;
-    for &d in deltas {
-        cur += d as u64;
+    let mut pos = 0;
+    for _ in 1..count {
+        // Decode varint
+        let mut value: u64 = 0;
+        let mut shift = 0;
+        loop {
+            if pos >= deltas.len() {
+                return Err("varint overflow".into());
+            }
+            let byte = deltas[pos];
+            pos += 1;
+            value |= ((byte & 0x7F) as u64) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift > 63 {
+                return Err("varint too large".into());
+            }
+        }
+        cur += value;
         out.push(cur);
     }
-    out
+    Ok(out)
 }
 
 /// Maximum alphabet size for MTF transform.
@@ -921,9 +958,9 @@ impl EventCodec for XinyuzengCodec {
             }
         }
 
-        // Use unsigned encoding for id_deltas since all deltas are non-negative after sorting
-        // This avoids the wasteful zigzag transform (which doubles positive values)
-        let (id_base, id_deltas) = delta_encode_u8_split(&ids);
+        // Use varint encoding for id_deltas since all deltas are non-negative after sorting
+        // Varint handles arbitrary delta sizes (training data max=251, but test data can be larger)
+        let (id_base, id_deltas) = delta_encode_varint_split(&ids);
         let ts_deltas = delta_encode_signed(&timestamps)?;
 
         let type_idx_bytes = zstd::encode_all(pack_bits_u32(&type_idx).as_slice(), ZSTD_LEVEL)?;
@@ -1182,12 +1219,12 @@ impl EventCodec for XinyuzengCodec {
         let dup_row_bitmap = dup_row_bitmap_raw;
         let dup_variant_idx = decode_u32_list(&dup_variant_idx_raw)?;
 
-        // Read base (8 bytes) then raw u8 deltas for id_deltas
+        // Read base (8 bytes) then varint deltas for id_deltas
         if id_deltas_raw.len() < 8 {
             return Err("id_deltas too short".into());
         }
         let id_base = u64::from_le_bytes(id_deltas_raw[0..8].try_into().unwrap());
-        let ids = delta_decode_u8_split(id_base, &id_deltas_raw[8..]);
+        let ids = delta_decode_varint_split(id_base, &id_deltas_raw[8..], row_count)?;
 
         let ts_deltas = unpack_bits_u64(&ts_deltas_raw, row_count)?;
         let timestamps = delta_decode_signed(&ts_deltas)?;
