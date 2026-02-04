@@ -8,6 +8,7 @@
 //! The decoder uses these block to perform "error-correction" phase.
 //!
 //! **Additional optimizations:**
+//! - pcodec for all numeric columns (IDs, types, counts, repo indices)
 //! - Split repo names into owner/suffix with dictionary encoding for owners
 //! - Better owner preprocessing inspired by kjcao's approach
 //!
