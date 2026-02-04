@@ -370,7 +370,6 @@ impl EventCodec for CometkimCodec {
             eprintln!("Errors: {} bytes", err_compressed.len());
         }
 
-
         Ok(Bytes::from(buf))
     }
 
