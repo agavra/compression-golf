@@ -35,11 +35,13 @@
 //! Error Batches:
 //!   batch_count: varint
 //!   for each batch: same as original format
+//!
+//! Set COMETKIM_DEBUG=1 to see column size statistics and compression experiments.
 
 use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
 use pco::standalone::{simple_compress, simple_decompress};
-use pco::{ChunkConfig, PagingSpec};
+use pco::ChunkConfig;
 use std::collections::HashMap;
 use std::error::Error;
 
@@ -47,6 +49,10 @@ use crate::codec::EventCodec;
 use crate::{EventKey, EventValue, Repo};
 
 const ZSTD_LEVEL: i32 = 22;
+
+fn debug_enabled() -> bool {
+    std::env::var("COMETKIM_DEBUG").is_ok()
+}
 
 // GitHub events are well-known.
 // All available events are listed on https://docs.github.com/en/rest/using-the-rest-api/github-event-types
@@ -287,18 +293,18 @@ impl EventCodec for CometkimCodec {
         encode_varint(clean_events.len() as u64, &mut buf);
         encode_varint(interval_count as u64, &mut buf);
 
-        // Repo dictionary (compressed as a block)
+        // Repo dictionary (compressed with zstd)
         let mut repo_buf = Vec::new();
         encode_repo_dictionary(&repo_list, &mut repo_buf)?;
         let repo_compressed = zstd::encode_all(&repo_buf[..], ZSTD_LEVEL)?;
         encode_varint(repo_compressed.len() as u64, &mut buf);
         buf.extend_from_slice(&repo_compressed);
 
-        // Clean timeseries - encode each column separately for better compression
-        // Column 1: Event counts per second (u8 is sufficient, ~50 events per second)
+        // Clean timeseries columns
+        // Column 1: Event counts per second
         let counts: Vec<u8> = events_by_second.iter().map(|s| s.len() as u8).collect();
 
-        // Column 2: Type indices (all events, flattened) - as u8 vec for pcodec
+        // Column 2: Type indices
         let mut all_types: Vec<u8> = Vec::new();
         for second_events in &events_by_second {
             for event in second_events {
@@ -306,7 +312,7 @@ impl EventCodec for CometkimCodec {
             }
         }
 
-        // Column 3: Event IDs (use pcodec for better compression of sequential data)
+        // Column 3: Event IDs
         let mut all_ids: Vec<u64> = Vec::new();
         for second_events in &events_by_second {
             for event in second_events {
@@ -314,7 +320,7 @@ impl EventCodec for CometkimCodec {
             }
         }
 
-        // Column 4: Repo indices (all events, flattened)
+        // Column 4: Repo indices
         let mut all_repo_indices: Vec<u32> = Vec::new();
         for second_events in &events_by_second {
             for event in second_events {
@@ -322,18 +328,17 @@ impl EventCodec for CometkimCodec {
             }
         }
 
-        // Compress each column using pcodec with max compression
+        // Use pcodec for numeric columns with max compression
         let mut pco_config = ChunkConfig::default();
         pco_config.compression_level = 12;
         pco_config.enable_8_bit = true;
-        pco_config.paging_spec = PagingSpec::EqualPagesUpTo(1 << 18);
 
         let counts_compressed = simple_compress(&counts, &pco_config)?;
         let types_compressed = simple_compress(&all_types, &pco_config)?;
         let ids_compressed = simple_compress(&all_ids, &pco_config)?;
         let repos_compressed = simple_compress(&all_repo_indices, &pco_config)?;
 
-        // Write compressed columns with lengths
+        // Write columns with lengths
         encode_varint(counts_compressed.len() as u64, &mut buf);
         buf.extend_from_slice(&counts_compressed);
         encode_varint(types_compressed.len() as u64, &mut buf);
@@ -343,7 +348,7 @@ impl EventCodec for CometkimCodec {
         encode_varint(repos_compressed.len() as u64, &mut buf);
         buf.extend_from_slice(&repos_compressed);
 
-        // Error batches (compressed as a block)
+        // Error batches (compressed with zstd)
         let mut err_buf = Vec::new();
         encode_varint(error_batches.len() as u64, &mut err_buf);
         for batch in &error_batches {
@@ -352,6 +357,18 @@ impl EventCodec for CometkimCodec {
         let err_compressed = zstd::encode_all(&err_buf[..], ZSTD_LEVEL)?;
         encode_varint(err_compressed.len() as u64, &mut buf);
         buf.extend_from_slice(&err_compressed);
+
+        if debug_enabled() {
+            // Debug size breakdown
+            eprintln!("=== Size Breakdown ===");
+            eprintln!("Repo dict: {} bytes", repo_compressed.len());
+            eprintln!("Counts: {} bytes", counts_compressed.len());
+            eprintln!("Types: {} bytes", types_compressed.len());
+            eprintln!("IDs: {} bytes", ids_compressed.len());
+            eprintln!("Repo idx: {} bytes", repos_compressed.len());
+            eprintln!("Errors: {} bytes", err_compressed.len());
+        }
+
 
         Ok(Bytes::from(buf))
     }
@@ -363,7 +380,7 @@ impl EventCodec for CometkimCodec {
 
         let mut pos = 0;
 
-        // Read header (uncompressed)
+        // Read header
         let base_id = u64::from_le_bytes(bytes[pos..pos + 8].try_into()?);
         pos += 8;
         let base_timestamp = u32::from_le_bytes(bytes[pos..pos + 4].try_into()?);
@@ -371,15 +388,14 @@ impl EventCodec for CometkimCodec {
         let total_clean_events = decode_varint(bytes, &mut pos) as usize;
         let interval_count = decode_varint(bytes, &mut pos) as usize;
 
-        // Read and decompress repo dictionary block
+        // Read and decompress repo dictionary
         let repo_len = decode_varint(bytes, &mut pos) as usize;
-        let repo_compressed = &bytes[pos..pos + repo_len];
+        let repo_bytes = zstd::decode_all(&bytes[pos..pos + repo_len])?;
         pos += repo_len;
-        let repo_bytes = zstd::decode_all(repo_compressed)?;
         let mut repo_pos = 0;
         let repo_list = decode_repo_dictionary(&repo_bytes, &mut repo_pos)?;
 
-        // Read and decompress column data
+        // Read column data (pcodec compressed)
         let counts_len = decode_varint(bytes, &mut pos) as usize;
         let counts: Vec<u8> = simple_decompress(&bytes[pos..pos + counts_len])?;
         pos += counts_len;
@@ -422,10 +438,9 @@ impl EventCodec for CometkimCodec {
             }
         }
 
-        // Read and decompress error batches block
+        // Read and decompress error batches
         let err_len = decode_varint(bytes, &mut pos) as usize;
-        let err_compressed = &bytes[pos..pos + err_len];
-        let err_bytes = zstd::decode_all(err_compressed)?;
+        let err_bytes = zstd::decode_all(&bytes[pos..pos + err_len])?;
         let mut err_pos = 0;
 
         let batch_count = decode_varint(&err_bytes, &mut err_pos) as usize;
@@ -599,11 +614,14 @@ fn encode_repo_dictionary(
         buf.push(0); // null terminator
     }
 
-    // Write owner indices for each repo (varint)
-    for entry in repo_list {
-        let idx = owner_to_idx[entry.owner.as_str()];
-        encode_varint(idx as u64, buf);
-    }
+    // Write owner indices for each repo (pcodec compressed)
+    let owner_indices: Vec<u32> = repo_list
+        .iter()
+        .map(|e| owner_to_idx[e.owner.as_str()])
+        .collect();
+    let owner_indices_compressed = simple_compress(&owner_indices, &pco_config)?;
+    encode_varint(owner_indices_compressed.len() as u64, buf);
+    buf.extend_from_slice(&owner_indices_compressed);
 
     // Write suffixes with transformations (like kjcao's approach)
     for entry in repo_list {
@@ -660,11 +678,11 @@ fn decode_repo_dictionary(bytes: &[u8], pos: &mut usize) -> Result<Vec<RepoEntry
         owner_list.push(owner);
     }
 
-    // Read owner indices
-    let mut owner_indices: Vec<usize> = Vec::with_capacity(count);
-    for _ in 0..count {
-        owner_indices.push(decode_varint(bytes, pos) as usize);
-    }
+    // Read owner indices (pcodec compressed)
+    let owner_indices_len = decode_varint(bytes, pos) as usize;
+    let owner_indices_u32: Vec<u32> = simple_decompress(&bytes[*pos..*pos + owner_indices_len])?;
+    *pos += owner_indices_len;
+    let owner_indices: Vec<usize> = owner_indices_u32.iter().map(|&i| i as usize).collect();
 
     // Read suffixes with transformations
     let mut repo_list: Vec<RepoEntry> = Vec::with_capacity(count);
