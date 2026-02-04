@@ -73,8 +73,8 @@ enum GitHubEventType {
     Watch = 15,
 }
 
-impl GitHubEventType {
-    fn from_str(s: &str) -> Self {
+impl From<&str> for GitHubEventType {
+    fn from(s: &str) -> Self {
         match s {
             "CommitCommentEvent" => GitHubEventType::CommitComment,
             "CreateEvent" => GitHubEventType::Create,
@@ -92,12 +92,14 @@ impl GitHubEventType {
             "PushEvent" => GitHubEventType::Push,
             "ReleaseEvent" => GitHubEventType::Release,
             "WatchEvent" => GitHubEventType::Watch,
-            _ => panic!(),
+            _ => panic!("Unknown event type: {}", s),
         }
     }
+}
 
-    fn to_str(&self) -> &'static str {
-        match self {
+impl From<GitHubEventType> for &'static str {
+    fn from(val: GitHubEventType) -> Self {
+        match val {
             GitHubEventType::CommitComment => "CommitCommentEvent",
             GitHubEventType::Create => "CreateEvent",
             GitHubEventType::Delete => "DeleteEvent",
@@ -116,8 +118,10 @@ impl GitHubEventType {
             GitHubEventType::Watch => "WatchEvent",
         }
     }
+}
 
-    fn from_u8(val: u8) -> Self {
+impl From<u8> for GitHubEventType {
+    fn from(val: u8) -> Self {
         match val {
             0 => GitHubEventType::CommitComment,
             1 => GitHubEventType::Create,
@@ -135,7 +139,7 @@ impl GitHubEventType {
             13 => GitHubEventType::Push,
             14 => GitHubEventType::Release,
             15 => GitHubEventType::Watch,
-            _ => panic!(),
+            _ => panic!("Unknown event type value: {}", val),
         }
     }
 }
@@ -235,7 +239,7 @@ impl EventCodec for CometkimCodec {
             .iter()
             .map(|(key, value)| {
                 let id: u64 = key.id.parse().unwrap();
-                let event_type = GitHubEventType::from_str(&key.event_type) as u8;
+                let event_type = GitHubEventType::from(key.event_type.as_str()) as u8;
                 let repo_key = (value.repo.id, value.repo.name.clone());
                 let repo_idx = *repo_to_idx.get(&repo_key).unwrap();
                 let timestamp = parse_timestamp(&value.created_at).unwrap();
@@ -394,8 +398,8 @@ impl EventCodec for CometkimCodec {
         let mut ids_pos = 0;
         let mut repos_pos = 0;
 
-        for second_offset in 0..interval_count {
-            let count = counts_bytes[second_offset] as usize;
+        for (second_offset, &count_byte) in counts_bytes.iter().enumerate().take(interval_count) {
+            let count = count_byte as usize;
 
             if count > 0 {
                 let timestamp = base_timestamp + second_offset as u32;
@@ -452,9 +456,7 @@ impl EventCodec for CometkimCodec {
                 let (repo_id, repo_name) = &repo_list[event.repo_idx as usize];
                 let key = EventKey {
                     id: event.id.to_string(),
-                    event_type: GitHubEventType::from_u8(event.event_type)
-                        .to_str()
-                        .to_string(),
+                    event_type: <&str>::from(GitHubEventType::from(event.event_type)).to_string(),
                 };
                 let value = EventValue {
                     repo: Repo {
@@ -472,10 +474,10 @@ impl EventCodec for CometkimCodec {
     }
 }
 
+type RepoDict = (HashMap<(u64, String), u32>, Vec<(u64, String)>);
+
 /// Build repo dictionary sorted by repo_id for delta compression
-fn build_repo_dictionary(
-    events: &[(EventKey, EventValue)],
-) -> (HashMap<(u64, String), u32>, Vec<(u64, String)>) {
+fn build_repo_dictionary(events: &[(EventKey, EventValue)]) -> RepoDict {
     let mut repo_set: HashMap<(u64, String), u32> = HashMap::new();
 
     for (_, value) in events {
