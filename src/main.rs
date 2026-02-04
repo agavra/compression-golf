@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader};
 
 mod agavra;
 mod codec;
+mod cometkim;
 mod fabinout;
 mod fulmicoton;
 mod hachikuji;
@@ -19,6 +20,7 @@ mod zstd;
 
 use agavra::AgavraCodec;
 use codec::EventCodec;
+use cometkim::CometkimCodec;
 use fabinout::FabinoutCodec;
 use hachikuji::HachikujiCodec;
 use jakedgy::JakedgyCodec;
@@ -204,6 +206,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         (Box::new(FulmicotonCodec), &sorted_events),
         (Box::new(XinyuzengCodec::new()), &sorted_events),
         (Box::new(KjcaoCodec::new()), &sorted_events),
+        (Box::new(CometkimCodec::new()), &events),
     ];
 
     for (codec, expected) in codecs {
