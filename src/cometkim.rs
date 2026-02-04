@@ -1,11 +1,15 @@
 //! # cometkim Codec
 //!
-//! **Strategy:**
-//! Assuming all data is correctly ordered by `created_at` field.
-//! It mostly is. There are exceptions in data but its rate is pretty low. (0.1218% in the sample data)
+//! **Core Strategy:**
+//! Assuming all data is correctly ordered by `created_at` field. (It mostly is)
+//! There are exceptions in data but its rate is pretty low. (0.1218% in the sample data)
 //!
-//! Push abnormal items into separate block.
-//! The decoder uses these blocks to perform post-processing for error correction.
+//! Push abnormal (out-of-order) items into separate block.
+//! The decoder uses these block to perform "error-correction" phase.
+//!
+//! **Additional optimizations:**
+//! - Split repo names into owner/suffix with dictionary encoding for owners
+//! - Better owner preprocessing inspired by kjcao's approach
 //!
 //! **Binary Format:**
 //!
@@ -18,8 +22,8 @@
 //! Repo Dictionary:
 //!   count: varint
 //!   repo_id_deltas: [signed_varint; count]  // first is absolute
-//!   name_lengths: [varint; count]
-//!   names_concat: [u8]
+//!   owner dictionary + indices
+//!   suffixes
 //!
 //! Clean Timeseries (per second):
 //!   event_count: u8
@@ -30,18 +34,12 @@
 //!
 //! Error Batches:
 //!   batch_count: varint
-//!   for each batch:
-//!     insert_position: varint
-//!     total_event_count: varint
-//!     interval_count: varint
-//!     timestamp_offsets: [varint; interval_count]
-//!     events_per_interval: [varint; interval_count]
-//!     type_indices: [u8; total_event_count]
-//!     event_ids: [u64; total_event_count]  // absolute IDs
-//!     repo_indices: [varint; total_event_count]
+//!   for each batch: same as original format
 
 use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
+use pco::standalone::{simple_compress, simple_decompress};
+use pco::{ChunkConfig, PagingSpec};
 use std::collections::HashMap;
 use std::error::Error;
 
@@ -213,6 +211,14 @@ struct ErrorBatchInterval {
     event_count: usize,
 }
 
+/// Repo entry with owner/suffix split
+#[derive(Clone, Debug)]
+struct RepoEntry {
+    id: u64,
+    owner: String,
+    suffix: String,
+}
+
 pub struct CometkimCodec;
 
 impl CometkimCodec {
@@ -231,7 +237,7 @@ impl EventCodec for CometkimCodec {
             return Ok(Bytes::new());
         }
 
-        // Step 1: Build repo dictionary
+        // Step 1: Build repo dictionary with owner/suffix split
         let (repo_to_idx, repo_list) = build_repo_dictionary(events);
 
         // Step 2: Parse all events
@@ -272,7 +278,7 @@ impl EventCodec for CometkimCodec {
             events_by_second[offset].push(event);
         }
 
-        // Step 6: Encode everything with per-column zstd compression
+        // Step 6: Encode everything with per-column compression
         let mut buf = Vec::new();
 
         // Header (uncompressed - small fixed size)
@@ -283,50 +289,49 @@ impl EventCodec for CometkimCodec {
 
         // Repo dictionary (compressed as a block)
         let mut repo_buf = Vec::new();
-        encode_repo_dictionary(&repo_list, &mut repo_buf);
+        encode_repo_dictionary(&repo_list, &mut repo_buf)?;
         let repo_compressed = zstd::encode_all(&repo_buf[..], ZSTD_LEVEL)?;
         encode_varint(repo_compressed.len() as u64, &mut buf);
         buf.extend_from_slice(&repo_compressed);
 
         // Clean timeseries - encode each column separately for better compression
-        // Column 1: Event counts per second
-        let mut counts_buf = Vec::new();
-        for second_events in &events_by_second {
-            counts_buf.push(second_events.len() as u8);
-        }
+        // Column 1: Event counts per second (u8 is sufficient, ~50 events per second)
+        let counts: Vec<u8> = events_by_second.iter().map(|s| s.len() as u8).collect();
 
-        // Column 2: Type indices (all events, flattened)
-        let mut types_buf = Vec::new();
+        // Column 2: Type indices (all events, flattened) - as u8 vec for pcodec
+        let mut all_types: Vec<u8> = Vec::new();
         for second_events in &events_by_second {
             for event in second_events {
-                types_buf.push(event.event_type);
+                all_types.push(event.event_type);
             }
         }
 
-        // Column 3: ID deltas (all events, flattened)
-        let mut ids_buf = Vec::new();
-        let mut prev_id = base_id as i64;
+        // Column 3: Event IDs (use pcodec for better compression of sequential data)
+        let mut all_ids: Vec<u64> = Vec::new();
         for second_events in &events_by_second {
             for event in second_events {
-                let delta = event.id as i64 - prev_id;
-                encode_signed_varint(delta, &mut ids_buf);
-                prev_id = event.id as i64;
+                all_ids.push(event.id);
             }
         }
 
         // Column 4: Repo indices (all events, flattened)
-        let mut repos_buf = Vec::new();
+        let mut all_repo_indices: Vec<u32> = Vec::new();
         for second_events in &events_by_second {
             for event in second_events {
-                encode_varint(event.repo_idx as u64, &mut repos_buf);
+                all_repo_indices.push(event.repo_idx);
             }
         }
 
-        // Compress each column with zstd
-        let counts_compressed = zstd::encode_all(&counts_buf[..], ZSTD_LEVEL)?;
-        let types_compressed = zstd::encode_all(&types_buf[..], ZSTD_LEVEL)?;
-        let ids_compressed = zstd::encode_all(&ids_buf[..], ZSTD_LEVEL)?;
-        let repos_compressed = zstd::encode_all(&repos_buf[..], ZSTD_LEVEL)?;
+        // Compress each column using pcodec with max compression
+        let mut pco_config = ChunkConfig::default();
+        pco_config.compression_level = 12;
+        pco_config.enable_8_bit = true;
+        pco_config.paging_spec = PagingSpec::EqualPagesUpTo(1 << 18);
+
+        let counts_compressed = simple_compress(&counts, &pco_config)?;
+        let types_compressed = simple_compress(&all_types, &pco_config)?;
+        let ids_compressed = simple_compress(&all_ids, &pco_config)?;
+        let repos_compressed = simple_compress(&all_repo_indices, &pco_config)?;
 
         // Write compressed columns with lengths
         encode_varint(counts_compressed.len() as u64, &mut buf);
@@ -376,43 +381,36 @@ impl EventCodec for CometkimCodec {
 
         // Read and decompress column data
         let counts_len = decode_varint(bytes, &mut pos) as usize;
-        let counts_bytes = zstd::decode_all(&bytes[pos..pos + counts_len])?;
+        let counts: Vec<u8> = simple_decompress(&bytes[pos..pos + counts_len])?;
         pos += counts_len;
 
         let types_len = decode_varint(bytes, &mut pos) as usize;
-        let types_bytes = zstd::decode_all(&bytes[pos..pos + types_len])?;
+        let all_types: Vec<u8> = simple_decompress(&bytes[pos..pos + types_len])?;
         pos += types_len;
 
         let ids_len = decode_varint(bytes, &mut pos) as usize;
-        let ids_bytes = zstd::decode_all(&bytes[pos..pos + ids_len])?;
+        let all_ids: Vec<u64> = simple_decompress(&bytes[pos..pos + ids_len])?;
         pos += ids_len;
 
         let repos_len = decode_varint(bytes, &mut pos) as usize;
-        let repos_bytes = zstd::decode_all(&bytes[pos..pos + repos_len])?;
+        let all_repo_indices: Vec<u32> = simple_decompress(&bytes[pos..pos + repos_len])?;
         pos += repos_len;
 
         // Parse clean timeseries from columns
         let mut clean_events: Vec<ParsedEvent> = Vec::with_capacity(total_clean_events);
-        let mut prev_id = base_id as i64;
-        let mut types_pos = 0;
-        let mut ids_pos = 0;
-        let mut repos_pos = 0;
+        let mut event_pos = 0;
 
-        for (second_offset, &count_byte) in counts_bytes.iter().enumerate().take(interval_count) {
-            let count = count_byte as usize;
+        for (second_offset, &count) in counts.iter().enumerate().take(interval_count) {
+            let count = count as usize;
 
             if count > 0 {
                 let timestamp = base_timestamp + second_offset as u32;
 
                 for _ in 0..count {
-                    let event_type = types_bytes[types_pos];
-                    types_pos += 1;
-
-                    let delta = decode_signed_varint(&ids_bytes, &mut ids_pos);
-                    prev_id += delta;
-                    let id = prev_id as u64;
-
-                    let repo_idx = decode_varint(&repos_bytes, &mut repos_pos) as u32;
+                    let event_type = all_types[event_pos];
+                    let id = all_ids[event_pos];
+                    let repo_idx = all_repo_indices[event_pos];
+                    event_pos += 1;
 
                     clean_events.push(ParsedEvent {
                         id,
@@ -453,14 +451,19 @@ impl EventCodec for CometkimCodec {
         let result: Vec<(EventKey, EventValue)> = final_events
             .into_iter()
             .map(|event| {
-                let (repo_id, repo_name) = &repo_list[event.repo_idx as usize];
+                let repo_entry = &repo_list[event.repo_idx as usize];
+                let repo_name = if repo_entry.suffix.is_empty() {
+                    repo_entry.owner.clone()
+                } else {
+                    format!("{}/{}", repo_entry.owner, repo_entry.suffix)
+                };
                 let key = EventKey {
                     id: event.id.to_string(),
                     event_type: <&str>::from(GitHubEventType::from(event.event_type)).to_string(),
                 };
                 let value = EventValue {
                     repo: Repo {
-                        id: *repo_id,
+                        id: repo_entry.id,
                         name: repo_name.clone(),
                         url: format!("https://api.github.com/repos/{}", repo_name),
                     },
@@ -474,33 +477,53 @@ impl EventCodec for CometkimCodec {
     }
 }
 
-type RepoDict = (HashMap<(u64, String), u32>, Vec<(u64, String)>);
+type RepoDict = (HashMap<(u64, String), u32>, Vec<RepoEntry>);
 
-/// Build repo dictionary sorted by repo_id for delta compression
+/// Build repo dictionary sorted by frequency for better index compression
+/// with owner/suffix split for better compression
 fn build_repo_dictionary(events: &[(EventKey, EventValue)]) -> RepoDict {
-    let mut repo_set: HashMap<(u64, String), u32> = HashMap::new();
-
+    // Count frequency of each repo
+    let mut repo_counts: HashMap<(u64, String), usize> = HashMap::new();
     for (_, value) in events {
         let key = (value.repo.id, value.repo.name.clone());
-        repo_set.entry(key).or_insert(0);
+        *repo_counts.entry(key).or_insert(0) += 1;
     }
 
-    // Sort by repo_id for better delta compression
-    let mut repo_list: Vec<(u64, String)> = repo_set.keys().cloned().collect();
-    repo_list.sort_by_key(|(id, _)| *id);
-
-    // Build index map
-    let repo_to_idx: HashMap<(u64, String), u32> = repo_list
-        .iter()
-        .enumerate()
-        .map(|(idx, key)| (key.clone(), idx as u32))
+    // Build repo entries
+    let mut repo_entries: Vec<((u64, String), RepoEntry, usize)> = repo_counts
+        .into_iter()
+        .map(|(key, count)| {
+            let parts: Vec<&str> = key.1.splitn(2, '/').collect();
+            let (owner, suffix) = if parts.len() == 2 {
+                (parts[0].to_string(), parts[1].to_string())
+            } else {
+                (key.1.clone(), String::new())
+            };
+            let entry = RepoEntry {
+                id: key.0,
+                owner,
+                suffix,
+            };
+            (key, entry, count)
+        })
         .collect();
+
+    // Sort by frequency (descending) so frequent repos get small indices
+    repo_entries.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+
+    // Build index map and repo list
+    let mut repo_to_idx: HashMap<(u64, String), u32> = HashMap::new();
+    let mut repo_list: Vec<RepoEntry> = Vec::with_capacity(repo_entries.len());
+
+    for (idx, (key, entry, _)) in repo_entries.into_iter().enumerate() {
+        repo_to_idx.insert(key, idx as u32);
+        repo_list.push(entry);
+    }
 
     (repo_to_idx, repo_list)
 }
 
 /// Separate clean events from error batches
-/// insert_position is tracked as the number of clean events before the error batch
 fn separate_errors(events: &[ParsedEvent]) -> (Vec<ParsedEvent>, Vec<ErrorBatch>) {
     let mut clean_events: Vec<ParsedEvent> = Vec::new();
     let mut error_batches: Vec<ErrorBatch> = Vec::new();
@@ -538,58 +561,156 @@ fn separate_errors(events: &[ParsedEvent]) -> (Vec<ParsedEvent>, Vec<ErrorBatch>
     (clean_events, error_batches)
 }
 
-/// Encode repo dictionary to buffer
-fn encode_repo_dictionary(repo_list: &[(u64, String)], buf: &mut Vec<u8>) {
+/// Encode repo dictionary with improved owner/suffix split and preprocessing
+fn encode_repo_dictionary(
+    repo_list: &[RepoEntry],
+    buf: &mut Vec<u8>,
+) -> Result<(), Box<dyn Error>> {
     encode_varint(repo_list.len() as u64, buf);
 
-    // Repo ID deltas (first is absolute, rest are deltas)
-    let mut prev_id: i64 = 0;
-    for (repo_id, _) in repo_list {
-        let delta = *repo_id as i64 - prev_id;
-        encode_signed_varint(delta, buf);
-        prev_id = *repo_id as i64;
+    // Repo IDs - use pcodec directly
+    let ids: Vec<u64> = repo_list.iter().map(|e| e.id).collect();
+    let mut pco_config = ChunkConfig::default();
+    pco_config.compression_level = 12;
+    let ids_compressed = simple_compress(&ids, &pco_config)?;
+    encode_varint(ids_compressed.len() as u64, buf);
+    buf.extend_from_slice(&ids_compressed);
+
+    // Build owner dictionary (frequency-sorted for better compression)
+    let mut owner_counts: HashMap<&str, usize> = HashMap::new();
+    for entry in repo_list {
+        *owner_counts.entry(&entry.owner).or_insert(0) += 1;
+    }
+    let mut owner_list: Vec<&str> = owner_counts.keys().copied().collect();
+    owner_list.sort_by(|a, b| owner_counts[b].cmp(&owner_counts[a]).then_with(|| a.cmp(b)));
+
+    let owner_to_idx: HashMap<&str, u32> = owner_list
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| (s, i as u32))
+        .collect();
+
+    // Write owner count
+    encode_varint(owner_list.len() as u64, buf);
+
+    // Write owner strings (null-terminated for efficient parsing)
+    for owner in &owner_list {
+        buf.extend_from_slice(owner.as_bytes());
+        buf.push(0); // null terminator
     }
 
-    // Name lengths
-    for (_, name) in repo_list {
-        encode_varint(name.len() as u64, buf);
+    // Write owner indices for each repo (varint)
+    for entry in repo_list {
+        let idx = owner_to_idx[entry.owner.as_str()];
+        encode_varint(idx as u64, buf);
     }
 
-    // Names concatenated
-    for (_, name) in repo_list {
-        buf.extend_from_slice(name.as_bytes());
+    // Write suffixes with transformations (like kjcao's approach)
+    for entry in repo_list {
+        let owner = &entry.owner;
+        let suffix = &entry.suffix;
+
+        if suffix == owner {
+            // Same as owner
+            buf.push(0x01);
+        } else if suffix.starts_with(owner) {
+            // Starts with owner
+            let remainder = &suffix[owner.len()..];
+            if let Some(first_char) = remainder.chars().next() {
+                if matches!(first_char, '-' | '_' | '.') {
+                    buf.push(0x02);
+                    buf.extend_from_slice(remainder.as_bytes());
+                    buf.push(0);
+                    continue;
+                }
+            }
+            // Fall through to raw
+            buf.push(0x00);
+            buf.extend_from_slice(suffix.as_bytes());
+            buf.push(0);
+        } else {
+            // Raw string
+            buf.push(0x00);
+            buf.extend_from_slice(suffix.as_bytes());
+            buf.push(0);
+        }
     }
+    Ok(())
 }
 
-/// Decode repo dictionary from buffer
-fn decode_repo_dictionary(
-    bytes: &[u8],
-    pos: &mut usize,
-) -> Result<Vec<(u64, String)>, Box<dyn Error>> {
+/// Decode repo dictionary
+fn decode_repo_dictionary(bytes: &[u8], pos: &mut usize) -> Result<Vec<RepoEntry>, Box<dyn Error>> {
     let count = decode_varint(bytes, pos) as usize;
 
-    // Decode repo ID deltas
-    let mut repo_ids: Vec<u64> = Vec::with_capacity(count);
-    let mut prev_id: i64 = 0;
-    for _ in 0..count {
-        let delta = decode_signed_varint(bytes, pos);
-        prev_id += delta;
-        repo_ids.push(prev_id as u64);
+    // Decode repo IDs with pcodec
+    let ids_len = decode_varint(bytes, pos) as usize;
+    let repo_ids: Vec<u64> = simple_decompress(&bytes[*pos..*pos + ids_len])?;
+    *pos += ids_len;
+
+    // Read owner dictionary
+    let owner_count = decode_varint(bytes, pos) as usize;
+    let mut owner_list: Vec<String> = Vec::with_capacity(owner_count);
+    for _ in 0..owner_count {
+        let null_pos = bytes[*pos..]
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(bytes.len() - *pos);
+        let owner = String::from_utf8(bytes[*pos..*pos + null_pos].to_vec())?;
+        *pos += null_pos + 1; // Skip null terminator
+        owner_list.push(owner);
     }
 
-    // Decode name lengths
-    let mut name_lengths: Vec<usize> = Vec::with_capacity(count);
+    // Read owner indices
+    let mut owner_indices: Vec<usize> = Vec::with_capacity(count);
     for _ in 0..count {
-        name_lengths.push(decode_varint(bytes, pos) as usize);
+        owner_indices.push(decode_varint(bytes, pos) as usize);
     }
 
-    // Decode names
-    let mut repo_list: Vec<(u64, String)> = Vec::with_capacity(count);
+    // Read suffixes with transformations
+    let mut repo_list: Vec<RepoEntry> = Vec::with_capacity(count);
     for i in 0..count {
-        let name_len = name_lengths[i];
-        let name = String::from_utf8(bytes[*pos..*pos + name_len].to_vec())?;
-        *pos += name_len;
-        repo_list.push((repo_ids[i], name));
+        let owner_idx = owner_indices[i];
+        let owner = if owner_idx < owner_list.len() {
+            owner_list[owner_idx].clone()
+        } else {
+            String::new()
+        };
+
+        let flag = bytes[*pos];
+        *pos += 1;
+
+        let suffix = match flag {
+            0x01 => {
+                // Same as owner
+                owner.clone()
+            }
+            0x02 => {
+                // Starts with owner + remainder
+                let null_pos = bytes[*pos..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(bytes.len() - *pos);
+                let remainder = String::from_utf8(bytes[*pos..*pos + null_pos].to_vec())?;
+                *pos += null_pos + 1;
+                format!("{}{}", owner, remainder)
+            }
+            _ => {
+                // Raw string
+                let null_pos = bytes[*pos..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(bytes.len() - *pos);
+                let raw = String::from_utf8(bytes[*pos..*pos + null_pos].to_vec())?;
+                *pos += null_pos + 1;
+                raw
+            }
+        };
+
+        repo_list.push(RepoEntry {
+            id: repo_ids[i],
+            owner,
+            suffix,
+        });
     }
 
     Ok(repo_list)
@@ -631,7 +752,7 @@ fn encode_error_batch(batch: &ErrorBatch, base_id: u64, base_timestamp: u32, buf
         buf.push(event.event_type);
     }
 
-    // Event ID deltas (using signed varint, first delta is from base_id)
+    // Event ID deltas
     let mut prev_id = base_id as i64;
     for event in &batch.events {
         let delta = event.id as i64 - prev_id;
@@ -671,7 +792,7 @@ fn decode_error_batch(
     let type_indices: Vec<u8> = bytes[*pos..*pos + total_event_count].to_vec();
     *pos += total_event_count;
 
-    // Event ID deltas (signed varint, first delta is from base_id)
+    // Event ID deltas
     let mut event_ids: Vec<u64> = Vec::with_capacity(total_event_count);
     let mut prev_id = base_id as i64;
     for _ in 0..total_event_count {
