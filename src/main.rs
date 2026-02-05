@@ -15,7 +15,9 @@ mod naive;
 mod natebrennand;
 mod samsond;
 mod xiangpenghao;
+mod yimingqiao;
 mod xinyuzeng;
+mod zpaq;
 mod zstd;
 
 use agavra::AgavraCodec;
@@ -29,6 +31,7 @@ use naive::NaiveCodec;
 use natebrennand::NatebrennandCodec;
 use samsond::SamsondCodec;
 use xiangpenghao::XiangpengHaoCodec;
+use yimingqiao::YimingQiaoCodec;
 use xinyuzeng::XinyuzengCodec;
 use zstd::ZstdCodec;
 
@@ -206,6 +209,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         (Box::new(FulmicotonCodec), &sorted_events),
         (Box::new(XinyuzengCodec::new()), &sorted_events),
         (Box::new(KjcaoCodec::new()), &sorted_events),
+        (Box::new(YimingQiaoCodec::new()), &sorted_events),
         (Box::new(CometkimCodec::new()), &events),
     ];
 
