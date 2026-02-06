@@ -1,43 +1,71 @@
 //! # cometkim Codec
 //!
-//! **Core Strategy:**
-//! Assuming all data is correctly ordered by `created_at` field. (It mostly is)
-//! There are exceptions in data but its rate is pretty low. (0.1218% in the sample data)
+//! ## Core Strategy
 //!
-//! Push abnormal (out-of-order) items into separate block.
-//! The decoder uses these block to perform "error-correction" phase.
+//! Assuming the original data is already sorted by timestamp,
+//! this codec leverages the ordering to create a compact timeseries representation.
 //!
-//! **Additional optimizations:**
-//! - pcodec for all numeric columns (IDs, types, counts, repo indices)
-//! - Split repo names into owner/suffix with dictionary encoding for owners
-//! - Better owner preprocessing inspired by kjcao's approach
+//! ### Timestamp-implicit encoding
 //!
-//! **Binary Format:**
+//! Instead of storing the timestamp value for each event,
+//! it uses the position in the event stream to infer the timestamp value,
+//! and grouping events by the timestamp (per second).
 //!
+//! Only store the count of events per second, and the event data in order.
+//!
+//! It's slightly more efficent because encoding 24K interval counts is more compact
+//! than encoding 1M per-event values, even with delta encoding, bit packing, etc.
+//!
+//! ### Out-of-order events
+//!
+//! There are some events that are out of order, but it's very rare (~0.2% in `data.json`).
+//!
+//! These are stored in separate "error batches" that are inserted back into the
+//! correct position while decoding, make it possible to restore the input order.
+//!
+//! ### Key Optimizations
+//!
+//! - Use columnar layout
+//! - Use varint for lengths (trivial)
+//! - Use pcodec compression for numeric columns
+//! - Split repo names into owner/suffix with dictionary encoding for owners (kjcao's approach)
+//!
+//! ## Binary Format
+//!
+//! ```
 //! Header:
-//!   base_id: u64
-//!   base_timestamp: u32 (seconds since epoch)
+//!   base_id: varint
+//!   base_timestamp: u32
 //!   total_clean_events: varint
-//!   interval_count: varint (seconds span of clean stream)
+//!   interval_count: varint      // seconds span of clean stream
 //!
 //! Repo Dictionary:
-//!   count: varint
-//!   repo_id_deltas: [signed_varint; count]  // first is absolute
-//!   owner dictionary + indices
-//!   suffixes
+//!   repo_dict_len: varint
+//!   repo_dict_data: zstd[
+//!     count: varint
+//!     ids: pcodec[u64]
+//!     owner_strings: [null-terminated strings]
+//!     owner_indices: pcodec[u32]
+//!     suffixes: [flag + optional string]
+//!   ]
 //!
-//! Clean Timeseries (per second):
-//!   event_count: u8
-//!   if event_count > 0:
-//!     type_indices: [u8; event_count]
-//!     id_deltas: [signed_varint; event_count]
-//!     repo_indices: [varint; event_count]
+//! Clean Timeseries:
+//!   counts: varint, pcodec[u8]       // events per second
+//!   types: varint, pcodec[u8]        // event type enums
+//!   id_offsets: varint, pcodec[u32]  // offset from base_id
+//!   repos: varint, pcodec[u32]       // repo dictionary indices
 //!
 //! Error Batches:
 //!   batch_count: varint
-//!   for each batch: same as original format
+//!   insert_positions: varint, pcodec[u32]
+//!   event_counts: varint, pcodec[u32]
+//!   types: varint, pcodec[u8]
+//!   id_offsets: varint, pcodec[u32]       // offset from base_id
+//!   repos: varing, pcodec[u32]
+//!   ts_neg_deltas: varint, pcodec[u16]    // negative delta from insert_ts
+//! ```
 //!
-//! Set COMETKIM_DEBUG=1 to see column size statistics and compression experiments.
+//! Set COMETKIM_DEBUG=1 to see column size statistics.
 
 use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
@@ -50,6 +78,13 @@ use crate::codec::EventCodec;
 use crate::{EventKey, EventValue, Repo};
 
 const ZSTD_LEVEL: i32 = 22;
+
+fn pco_config() -> ChunkConfig {
+    let mut config = ChunkConfig::default();
+    config.compression_level = 12;
+    config.enable_8_bit = true; // pcodec is good for large [u8]
+    config
+}
 
 fn debug_enabled() -> bool {
     std::env::var("COMETKIM_DEBUG").is_ok()
@@ -173,16 +208,6 @@ fn decode_varint(bytes: &[u8], pos: &mut usize) -> u64 {
     result
 }
 
-fn encode_signed_varint(value: i64, buf: &mut Vec<u8>) {
-    let encoded = ((value << 1) ^ (value >> 63)) as u64;
-    encode_varint(encoded, buf);
-}
-
-fn decode_signed_varint(bytes: &[u8], pos: &mut usize) -> i64 {
-    let encoded = decode_varint(bytes, pos);
-    ((encoded >> 1) as i64) ^ (-((encoded & 1) as i64))
-}
-
 fn parse_timestamp(ts: &str) -> Option<u32> {
     DateTime::parse_from_rfc3339(ts)
         .ok()
@@ -212,12 +237,6 @@ struct ErrorBatch {
     events: Vec<ParsedEvent>, // events in this batch
 }
 
-/// Grouped events by timestamp within an error batch
-struct ErrorBatchInterval {
-    timestamp_offset: u32, // offset from base_timestamp
-    event_count: usize,
-}
-
 /// Repo entry with owner/suffix split
 #[derive(Clone, Debug)]
 struct RepoEntry {
@@ -244,6 +263,8 @@ impl EventCodec for CometkimCodec {
             return Ok(Bytes::new());
         }
 
+        let pco_config = pco_config();
+
         // Step 1: Build repo dictionary with owner/suffix split
         let (repo_to_idx, repo_list) = build_repo_dictionary(events);
 
@@ -268,15 +289,11 @@ impl EventCodec for CometkimCodec {
         // Step 3: Separate clean events and error batches
         let (clean_events, error_batches) = separate_errors(&parsed_events);
 
-        // Step 4: Calculate base values
-        let base_id = clean_events.iter().map(|e| e.id).min().unwrap_or(0);
-        let base_timestamp = clean_events.iter().map(|e| e.timestamp).min().unwrap_or(0);
-        let max_timestamp = clean_events.iter().map(|e| e.timestamp).max().unwrap_or(0);
-        let interval_count = if max_timestamp >= base_timestamp {
-            (max_timestamp - base_timestamp + 1) as usize
-        } else {
-            0
-        };
+        // Step 4: Calculate base values (clean events are sorted, IDs are monotonically increasing)
+        let base_id = clean_events.first().map(|e| e.id).unwrap_or(0);
+        let base_timestamp = clean_events.first().map(|e| e.timestamp).unwrap_or(0);
+        let max_timestamp = clean_events.last().map(|e| e.timestamp).unwrap_or(0);
+        let interval_count = (max_timestamp - base_timestamp + 1) as usize;
 
         // Step 5: Group clean events by second
         let mut events_by_second: Vec<Vec<&ParsedEvent>> = vec![Vec::new(); interval_count];
@@ -289,14 +306,14 @@ impl EventCodec for CometkimCodec {
         let mut buf = Vec::new();
 
         // Header (uncompressed - small fixed size)
-        buf.extend_from_slice(&base_id.to_le_bytes());
+        encode_varint(base_id, &mut buf);
         buf.extend_from_slice(&base_timestamp.to_le_bytes());
         encode_varint(clean_events.len() as u64, &mut buf);
         encode_varint(interval_count as u64, &mut buf);
 
         // Repo dictionary (compressed with zstd)
         let mut repo_buf = Vec::new();
-        encode_repo_dictionary(&repo_list, &mut repo_buf)?;
+        encode_repo_dictionary(&pco_config, &repo_list, &mut repo_buf)?;
         let repo_compressed = zstd::encode_all(&repo_buf[..], ZSTD_LEVEL)?;
         encode_varint(repo_compressed.len() as u64, &mut buf);
         buf.extend_from_slice(&repo_compressed);
@@ -313,11 +330,11 @@ impl EventCodec for CometkimCodec {
             }
         }
 
-        // Column 3: Event IDs
-        let mut all_ids: Vec<u64> = Vec::new();
+        // Column 3: Event ID offsets (IDs are monotonically increasing, store as u32 offset from base_id)
+        let mut all_id_offsets: Vec<u32> = Vec::new();
         for second_events in &events_by_second {
             for event in second_events {
-                all_ids.push(event.id);
+                all_id_offsets.push((event.id - base_id) as u32);
             }
         }
 
@@ -329,14 +346,10 @@ impl EventCodec for CometkimCodec {
             }
         }
 
-        // Use pcodec for numeric columns with max compression
-        let mut pco_config = ChunkConfig::default();
-        pco_config.compression_level = 12;
-        pco_config.enable_8_bit = true;
-
+        // Use pcodec for numeric columns
         let counts_compressed = simple_compress(&counts, &pco_config)?;
         let types_compressed = simple_compress(&all_types, &pco_config)?;
-        let ids_compressed = simple_compress(&all_ids, &pco_config)?;
+        let ids_compressed = simple_compress(&all_id_offsets, &pco_config)?;
         let repos_compressed = simple_compress(&all_repo_indices, &pco_config)?;
 
         // Write columns with lengths
@@ -349,15 +362,17 @@ impl EventCodec for CometkimCodec {
         encode_varint(repos_compressed.len() as u64, &mut buf);
         buf.extend_from_slice(&repos_compressed);
 
-        // Error batches (compressed with zstd)
-        let mut err_buf = Vec::new();
-        encode_varint(error_batches.len() as u64, &mut err_buf);
-        for batch in &error_batches {
-            encode_error_batch(batch, base_id, base_timestamp, &mut err_buf);
-        }
-        let err_compressed = zstd::encode_all(&err_buf[..], ZSTD_LEVEL)?;
-        encode_varint(err_compressed.len() as u64, &mut buf);
-        buf.extend_from_slice(&err_compressed);
+        // Error batches
+        let err_start = buf.len();
+        encode_error_batches(
+            &pco_config,
+            &error_batches,
+            base_id,
+            base_timestamp,
+            &clean_events,
+            &mut buf,
+        )?;
+        let err_size = buf.len() - err_start;
 
         if debug_enabled() {
             // Debug size breakdown
@@ -367,7 +382,7 @@ impl EventCodec for CometkimCodec {
             eprintln!("Types: {} bytes", types_compressed.len());
             eprintln!("IDs: {} bytes", ids_compressed.len());
             eprintln!("Repo idx: {} bytes", repos_compressed.len());
-            eprintln!("Errors: {} bytes", err_compressed.len());
+            eprintln!("Errors: {} bytes", err_size);
         }
 
         Ok(Bytes::from(buf))
@@ -381,8 +396,7 @@ impl EventCodec for CometkimCodec {
         let mut pos = 0;
 
         // Read header
-        let base_id = u64::from_le_bytes(bytes[pos..pos + 8].try_into()?);
-        pos += 8;
+        let base_id = decode_varint(bytes, &mut pos);
         let base_timestamp = u32::from_le_bytes(bytes[pos..pos + 4].try_into()?);
         pos += 4;
         let total_clean_events = decode_varint(bytes, &mut pos) as usize;
@@ -405,7 +419,7 @@ impl EventCodec for CometkimCodec {
         pos += types_len;
 
         let ids_len = decode_varint(bytes, &mut pos) as usize;
-        let all_ids: Vec<u64> = simple_decompress(&bytes[pos..pos + ids_len])?;
+        let all_id_offsets: Vec<u32> = simple_decompress(&bytes[pos..pos + ids_len])?;
         pos += ids_len;
 
         let repos_len = decode_varint(bytes, &mut pos) as usize;
@@ -424,7 +438,7 @@ impl EventCodec for CometkimCodec {
 
                 for _ in 0..count {
                     let event_type = all_types[event_pos];
-                    let id = all_ids[event_pos];
+                    let id = base_id + all_id_offsets[event_pos] as u64;
                     let repo_idx = all_repo_indices[event_pos];
                     event_pos += 1;
 
@@ -439,17 +453,8 @@ impl EventCodec for CometkimCodec {
         }
 
         // Read and decompress error batches
-        let err_len = decode_varint(bytes, &mut pos) as usize;
-        let err_bytes = zstd::decode_all(&bytes[pos..pos + err_len])?;
-        let mut err_pos = 0;
-
-        let batch_count = decode_varint(&err_bytes, &mut err_pos) as usize;
-        let mut error_batches: Vec<ErrorBatch> = Vec::with_capacity(batch_count);
-
-        for _ in 0..batch_count {
-            let batch = decode_error_batch(&err_bytes, &mut err_pos, base_id, base_timestamp)?;
-            error_batches.push(batch);
-        }
+        let error_batches =
+            decode_error_batches(bytes, &mut pos, base_id, base_timestamp, &clean_events)?;
 
         // Reconstruct final events by inserting error batches
         let mut final_events = clean_events;
@@ -524,6 +529,7 @@ fn build_repo_dictionary(events: &[(EventKey, EventValue)]) -> RepoDict {
         .collect();
 
     // Sort by frequency (descending) so frequent repos get small indices
+    // (ID order saves 92KB on dict but loses 110KB on indices - frequency wins)
     repo_entries.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
 
     // Build index map and repo list
@@ -578,16 +584,15 @@ fn separate_errors(events: &[ParsedEvent]) -> (Vec<ParsedEvent>, Vec<ErrorBatch>
 
 /// Encode repo dictionary with improved owner/suffix split and preprocessing
 fn encode_repo_dictionary(
+    pco_config: &ChunkConfig,
     repo_list: &[RepoEntry],
     buf: &mut Vec<u8>,
 ) -> Result<(), Box<dyn Error>> {
     encode_varint(repo_list.len() as u64, buf);
 
-    // Repo IDs - use pcodec directly
+    // Repo IDs - pcodec alone is best (492KB vs varint+zstd 761KB)
     let ids: Vec<u64> = repo_list.iter().map(|e| e.id).collect();
-    let mut pco_config = ChunkConfig::default();
-    pco_config.compression_level = 12;
-    let ids_compressed = simple_compress(&ids, &pco_config)?;
+    let ids_compressed = simple_compress(&ids, pco_config)?;
     encode_varint(ids_compressed.len() as u64, buf);
     buf.extend_from_slice(&ids_compressed);
 
@@ -619,7 +624,7 @@ fn encode_repo_dictionary(
         .iter()
         .map(|e| owner_to_idx[e.owner.as_str()])
         .collect();
-    let owner_indices_compressed = simple_compress(&owner_indices, &pco_config)?;
+    let owner_indices_compressed = simple_compress(&owner_indices, pco_config)?;
     encode_varint(owner_indices_compressed.len() as u64, buf);
     buf.extend_from_slice(&owner_indices_compressed);
 
@@ -734,115 +739,143 @@ fn decode_repo_dictionary(bytes: &[u8], pos: &mut usize) -> Result<Vec<RepoEntry
     Ok(repo_list)
 }
 
-/// Encode error batch to buffer
-fn encode_error_batch(batch: &ErrorBatch, base_id: u64, base_timestamp: u32, buf: &mut Vec<u8>) {
-    encode_varint(batch.insert_position as u64, buf);
-    encode_varint(batch.events.len() as u64, buf);
+fn encode_error_batches(
+    pco_config: &ChunkConfig,
+    batches: &[ErrorBatch],
+    base_id: u64,
+    base_timestamp: u32,
+    clean_events: &[ParsedEvent],
+    buf: &mut Vec<u8>,
+) -> Result<(), Box<dyn Error>> {
+    encode_varint(batches.len() as u64, buf);
+    if batches.is_empty() {
+        return Ok(());
+    }
 
-    // Group events by timestamp
-    let mut intervals: Vec<ErrorBatchInterval> = Vec::new();
-    let mut current_ts: Option<u32> = None;
+    // Collect all batch metadata
+    let mut insert_positions: Vec<u32> = Vec::new();
+    let mut event_counts: Vec<u32> = Vec::new();
 
-    for event in &batch.events {
-        if current_ts == Some(event.timestamp) {
-            intervals.last_mut().unwrap().event_count += 1;
+    // Collect all event data (one entry per event)
+    let mut all_types: Vec<u8> = Vec::new();
+    let mut all_id_offsets: Vec<u32> = Vec::new();
+    let mut all_repos: Vec<u32> = Vec::new();
+    let mut all_ts_neg_deltas: Vec<u16> = Vec::new();
+
+    for batch in batches {
+        insert_positions.push(batch.insert_position as u32);
+        event_counts.push(batch.events.len() as u32);
+
+        // Get the timestamp at insert position (or base if at start)
+        let insert_ts = if batch.insert_position > 0 && batch.insert_position <= clean_events.len()
+        {
+            clean_events[batch.insert_position - 1].timestamp
         } else {
-            intervals.push(ErrorBatchInterval {
-                timestamp_offset: event.timestamp.saturating_sub(base_timestamp),
-                event_count: 1,
-            });
-            current_ts = Some(event.timestamp);
+            base_timestamp
+        };
+
+        for event in &batch.events {
+            all_types.push(event.event_type);
+            all_id_offsets.push((event.id - base_id) as u32);
+            all_repos.push(event.repo_idx);
+            // Store absolute negative delta (max ~2500)
+            let neg_delta = insert_ts.saturating_sub(event.timestamp);
+            all_ts_neg_deltas.push(neg_delta as u16);
         }
     }
 
-    // Write interval info
-    encode_varint(intervals.len() as u64, buf);
-    for interval in &intervals {
-        encode_varint(interval.timestamp_offset as u64, buf);
-    }
-    for interval in &intervals {
-        encode_varint(interval.event_count as u64, buf);
-    }
+    let insert_pos_comp = simple_compress(&insert_positions, pco_config)?;
+    let event_counts_comp = simple_compress(&event_counts, pco_config)?;
+    let types_comp = simple_compress(&all_types, pco_config)?;
+    let ids_comp = simple_compress(&all_id_offsets, pco_config)?;
+    let repos_comp = simple_compress(&all_repos, pco_config)?;
+    let ts_comp = simple_compress(&all_ts_neg_deltas, pco_config)?;
 
-    // Write columnar data
-    // Type indices
-    for event in &batch.events {
-        buf.push(event.event_type);
-    }
+    encode_varint(insert_pos_comp.len() as u64, buf);
+    buf.extend_from_slice(&insert_pos_comp);
+    encode_varint(event_counts_comp.len() as u64, buf);
+    buf.extend_from_slice(&event_counts_comp);
+    encode_varint(types_comp.len() as u64, buf);
+    buf.extend_from_slice(&types_comp);
+    encode_varint(ids_comp.len() as u64, buf);
+    buf.extend_from_slice(&ids_comp);
+    encode_varint(repos_comp.len() as u64, buf);
+    buf.extend_from_slice(&repos_comp);
+    encode_varint(ts_comp.len() as u64, buf);
+    buf.extend_from_slice(&ts_comp);
 
-    // Event ID deltas
-    let mut prev_id = base_id as i64;
-    for event in &batch.events {
-        let delta = event.id as i64 - prev_id;
-        encode_signed_varint(delta, buf);
-        prev_id = event.id as i64;
-    }
-
-    // Repo indices
-    for event in &batch.events {
-        encode_varint(event.repo_idx as u64, buf);
-    }
+    Ok(())
 }
 
-/// Decode error batch from buffer
-fn decode_error_batch(
+fn decode_error_batches(
     bytes: &[u8],
     pos: &mut usize,
     base_id: u64,
     base_timestamp: u32,
-) -> Result<ErrorBatch, Box<dyn Error>> {
-    let insert_position = decode_varint(bytes, pos) as usize;
-    let total_event_count = decode_varint(bytes, pos) as usize;
-
-    // Read interval info
-    let interval_count = decode_varint(bytes, pos) as usize;
-    let mut timestamp_offsets: Vec<u32> = Vec::with_capacity(interval_count);
-    for _ in 0..interval_count {
-        timestamp_offsets.push(decode_varint(bytes, pos) as u32);
-    }
-    let mut events_per_interval: Vec<usize> = Vec::with_capacity(interval_count);
-    for _ in 0..interval_count {
-        events_per_interval.push(decode_varint(bytes, pos) as usize);
+    clean_events: &[ParsedEvent],
+) -> Result<Vec<ErrorBatch>, Box<dyn Error>> {
+    let batch_count = decode_varint(bytes, pos) as usize;
+    if batch_count == 0 {
+        return Ok(Vec::new());
     }
 
-    // Read columnar data
-    // Type indices
-    let type_indices: Vec<u8> = bytes[*pos..*pos + total_event_count].to_vec();
-    *pos += total_event_count;
+    // Read all compressed sections
+    let insert_pos_len = decode_varint(bytes, pos) as usize;
+    let insert_positions: Vec<u32> = simple_decompress(&bytes[*pos..*pos + insert_pos_len])?;
+    *pos += insert_pos_len;
 
-    // Event ID deltas
-    let mut event_ids: Vec<u64> = Vec::with_capacity(total_event_count);
-    let mut prev_id = base_id as i64;
-    for _ in 0..total_event_count {
-        let delta = decode_signed_varint(bytes, pos);
-        prev_id += delta;
-        event_ids.push(prev_id as u64);
-    }
+    let event_counts_len = decode_varint(bytes, pos) as usize;
+    let event_counts: Vec<u32> = simple_decompress(&bytes[*pos..*pos + event_counts_len])?;
+    *pos += event_counts_len;
 
-    // Repo indices
-    let mut repo_indices: Vec<u32> = Vec::with_capacity(total_event_count);
-    for _ in 0..total_event_count {
-        repo_indices.push(decode_varint(bytes, pos) as u32);
-    }
+    let types_len = decode_varint(bytes, pos) as usize;
+    let all_types: Vec<u8> = simple_decompress(&bytes[*pos..*pos + types_len])?;
+    *pos += types_len;
 
-    // Reconstruct events with timestamps
-    let mut events: Vec<ParsedEvent> = Vec::with_capacity(total_event_count);
-    let mut event_idx = 0;
-    for (interval_idx, &count) in events_per_interval.iter().enumerate() {
-        let timestamp = base_timestamp + timestamp_offsets[interval_idx];
-        for _ in 0..count {
+    let ids_len = decode_varint(bytes, pos) as usize;
+    let all_id_offsets: Vec<u32> = simple_decompress(&bytes[*pos..*pos + ids_len])?;
+    *pos += ids_len;
+
+    let repos_len = decode_varint(bytes, pos) as usize;
+    let all_repos: Vec<u32> = simple_decompress(&bytes[*pos..*pos + repos_len])?;
+    *pos += repos_len;
+
+    let ts_len = decode_varint(bytes, pos) as usize;
+    let all_ts_neg_deltas: Vec<u16> = simple_decompress(&bytes[*pos..*pos + ts_len])?;
+    *pos += ts_len;
+
+    // Reconstruct batches
+    let mut batches: Vec<ErrorBatch> = Vec::with_capacity(batch_count);
+    let mut event_offset: usize = 0;
+
+    for batch_idx in 0..batch_count {
+        let insert_position = insert_positions[batch_idx] as usize;
+        let event_count = event_counts[batch_idx] as usize;
+
+        // Get the timestamp at insert position (or base if at start)
+        let insert_ts = if insert_position > 0 && insert_position <= clean_events.len() {
+            clean_events[insert_position - 1].timestamp
+        } else {
+            base_timestamp
+        };
+
+        // Reconstruct events
+        let mut events: Vec<ParsedEvent> = Vec::with_capacity(event_count);
+        for _ in 0..event_count {
             events.push(ParsedEvent {
-                id: event_ids[event_idx],
-                event_type: type_indices[event_idx],
-                repo_idx: repo_indices[event_idx],
-                timestamp,
+                id: base_id + all_id_offsets[event_offset] as u64,
+                event_type: all_types[event_offset],
+                repo_idx: all_repos[event_offset],
+                timestamp: insert_ts - all_ts_neg_deltas[event_offset] as u32,
             });
-            event_idx += 1;
+            event_offset += 1;
         }
+
+        batches.push(ErrorBatch {
+            insert_position,
+            events,
+        });
     }
 
-    Ok(ErrorBatch {
-        insert_position,
-        events,
-    })
+    Ok(batches)
 }

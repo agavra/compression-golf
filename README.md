@@ -17,7 +17,7 @@ This leaderboard uses the `data.json.gz` dataset included in the repo. Use this 
 | 1    | [kjcao](src/kjcao.rs)              | 5,188,464    |
 | 2    | [fulmicoton](src/fulmicoton.rs)    | 5,677,291    |
 | 3    | [xinyuzeng](src/xinyuzeng.rs)      | 5,784,827    |
-| 4    | [cometkim](src/cometkim.rs)        | 5,797,365    |
+| 4    | [cometkim](src/cometkim.rs)        | 5,789,637    |
 | 5    | [natebrennand](src/natebrennand.rs)| 5,996,236    |
 | 6    | [jakedgy](src/jakedgy.rs)          | 6,402,499    |
 | 7    | [hachikuji](src/hachikuji.rs)      | 6,524,516    |
