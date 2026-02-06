@@ -1,6 +1,7 @@
 //! YimingQiao Codec
 //!
-//! - Uses Kjcao's column layout and compressors for everything except event_id.
+//! - Uses Kjcao's numeric layout/compressors (mapping_ids + repo_indices), but
+//!   repo names are stored as split owner/suffix streams.
 //! - event_id column is encoded with static rANS + ESC symbol (delta-based),
 //!   and a variable-length frequency table (bitmask + varints).
 
@@ -15,7 +16,6 @@ use std::io::{Cursor, Write};
 use std::path::Path;
 
 use crate::codec::EventCodec;
-use crate::zpaq5 as zpaq;
 use crate::{EventKey, EventValue, Repo};
 use std::error::Error;
 
@@ -843,6 +843,7 @@ mod lpaq1 {
 
 pub struct YimingQiaoCodec;
 
+#[allow(dead_code)]
 fn preprocess_repo_names(input_data: &[u8]) -> Vec<u8> {
     // 1. Parse input data
     let input_str = String::from_utf8_lossy(input_data);
@@ -963,6 +964,7 @@ fn preprocess_repo_names(input_data: &[u8]) -> Vec<u8> {
     output
 }
 
+#[allow(dead_code)]
 fn invert_preprocess_repo_name(compressed_data: &[u8]) -> Vec<u8> {
     let mut cursor = compressed_data;
     let mut result = Vec::new();
@@ -1120,6 +1122,7 @@ fn invert_preprocess_repo_name(compressed_data: &[u8]) -> Vec<u8> {
     }
     result
 }
+
 
 // ============================================================================
 // rANS (static) for event_id deltas with ESC symbol
@@ -2707,25 +2710,6 @@ impl EventCodec for YimingQiaoCodec {
             })
             .collect();
 
-        // Sort mapping by repo_id for delta compression
-        let mut mapping_entries: Vec<(u64, String)> = repo_pairs.into_iter().collect();
-        mapping_entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-
-        let num_mapping = mapping_entries.len();
-        if num_mapping > (1 << 24) - 1 {
-            return Err(format!(
-                "Too many unique repo entries: {} (max 16,777,215)",
-                num_mapping
-            )
-            .into());
-        }
-
-        let pair_to_idx: HashMap<(u64, String), u32> = mapping_entries
-            .iter()
-            .enumerate()
-            .map(|(idx, (id, name))| ((*id, name.clone()), idx as u32))
-            .collect();
-
         // Sort events by ID for optimal compression
         raw_events.sort_by_key(|e| e.id);
         let num_events = raw_events.len();
@@ -2742,45 +2726,91 @@ impl EventCodec for YimingQiaoCodec {
             .map(|(idx, t)| (t.clone(), idx as u8))
             .collect();
 
-        // 1. Mapping IDs: sorted u64s (pco will delta encode)
-        let mapping_ids: Vec<u64> = mapping_entries.iter().map(|(id, _)| *id).collect();
-
-        // 2. Mapping names: newline-separated UTF-8
-        let mapping_names_raw: Vec<u8> = mapping_entries
-            .iter()
-            .map(|(_, name)| name.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
-            .into_bytes();
-
-        // 3. Event type dict: newline-separated
+        // 1. Event type dict: newline-separated
         let dict_raw: Vec<u8> = type_list.join("\n").into_bytes();
 
-        // 4. Event type indices: Vec<u8>
+        // 2. Event type indices: Vec<u8>
         let type_indices: Vec<u8> = raw_events
             .iter()
             .map(|e| *type_to_idx.get(&e.type_name).unwrap())
             .collect();
 
-        // 5. Event IDs: sorted u64s (pco will delta encode)
+        // 3. Event IDs: sorted u64s (pco will delta encode)
         let event_ids: Vec<u64> = raw_events.iter().map(|e| e.id).collect();
 
-        // 6. Repo indices: Vec<u32>
+        // Build mapping by (repo_id, repo_name)
+        let mut mapping_entries: Vec<(u64, String)> = repo_pairs.into_iter().collect();
+        mapping_entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let num_mapping = mapping_entries.len();
+        if num_mapping > (1 << 24) - 1 {
+            return Err(format!(
+                "Too many unique repo entries: {} (max 16,777,215)",
+                num_mapping
+            )
+            .into());
+        }
+
+        let pair_to_idx: HashMap<(u64, String), u32> = mapping_entries
+            .iter()
+            .enumerate()
+            .map(|(idx, (id, name))| ((*id, name.clone()), idx as u32))
+            .collect();
+
+        let mapping_ids: Vec<u64> = mapping_entries.iter().map(|(id, _)| *id).collect();
+
+        // 4. Repo indices: Vec<u32>
         let repo_indices: Vec<u32> = raw_events
             .iter()
             .map(|e| *pair_to_idx.get(&(e.repo_id, e.repo_name.clone())).unwrap())
             .collect();
 
-        // 7. Timestamps: i64s (pco will delta encode)
+        // 5. Timestamps: i64s (pco will delta encode)
         let timestamps: Vec<i64> = raw_events.iter().map(|e| e.ts).collect();
 
-        let mapping_names_pre = preprocess_repo_names(mapping_names_raw.as_slice());
+        // 6. Repo names: split into owner + suffix streams
+        let mut owners: Vec<String> = Vec::with_capacity(num_mapping);
+        let mut repos: Vec<String> = Vec::with_capacity(num_mapping);
+        for (_, name) in &mapping_entries {
+            if let Some(pos) = name.find('/') {
+                owners.push(name[..pos].to_string());
+                repos.push(name[pos + 1..].to_string());
+            } else {
+                owners.push(String::new());
+                repos.push(name.clone());
+            }
+        }
 
-        // Optional: export column buffers for external compressors (e.g., zpaq -m5)
+        let owners_raw: Vec<u8> = owners.join("\n").into_bytes();
+
+        let mut repo_suffixes_raw: Vec<u8> = Vec::new();
+        for (owner, repo) in owners.iter().zip(repos.iter()) {
+            if repo == owner {
+                repo_suffixes_raw.push(0x01);
+            } else if repo.starts_with(owner) {
+                let remainder = &repo[owner.len()..];
+                if let Some(first_char) = remainder.chars().next() {
+                    if matches!(first_char, '-' | '_' | '.') {
+                        repo_suffixes_raw.push(0x02);
+                        repo_suffixes_raw.extend_from_slice(remainder.as_bytes());
+                        repo_suffixes_raw.push(0);
+                        continue;
+                    }
+                }
+                repo_suffixes_raw.push(0x00);
+                repo_suffixes_raw.extend_from_slice(repo.as_bytes());
+                repo_suffixes_raw.push(0);
+            } else {
+                repo_suffixes_raw.push(0x00);
+                repo_suffixes_raw.extend_from_slice(repo.as_bytes());
+                repo_suffixes_raw.push(0);
+            }
+        }
+
+        // Optional: export column buffers for external compressors.
         maybe_dump_columns(
             &mapping_ids,
-            &mapping_names_raw,
-            mapping_names_pre.as_slice(),
+            &owners_raw,
+            &repo_suffixes_raw,
             &dict_raw,
             &type_indices,
             &event_ids,
@@ -2796,9 +2826,11 @@ impl EventCodec for YimingQiaoCodec {
         // Use pcodec for numeric columns with clear deltas. Use lpaq1 for
         // everything else.
         let mapping_ids_comp = simple_compress(&mapping_ids, &pco_config)?;
-        let type_comp = zpaq::compress_text(&type_indices);
+        let owners_comp = lpaq1::compress_text(owners_raw.as_slice());
+        let repo_suffixes_comp = lpaq1::compress_text(repo_suffixes_raw.as_slice());
+        let type_comp = lpaq1::compress_text(&type_indices);
         let event_ids_comp = encode_event_ids_rans(&event_ids)?;
-        let repo_comp = zpaq::compress_text(
+        let repo_comp = lpaq1::compress_text(
             repo_indices
                 .iter()
                 .flat_map(|&num| num.to_le_bytes())
@@ -2806,18 +2838,18 @@ impl EventCodec for YimingQiaoCodec {
                 .as_slice(),
         );
         let ts_comp = encode_timestamps_rans(&timestamps)?;
-        let mapping_names_comp = zpaq::compress_text(mapping_names_pre.as_slice());
-        let dict_comp = zpaq::compress_text(&dict_raw);
+        let dict_comp = lpaq1::compress_text(&dict_raw);
 
-        // --- Header (40 bytes) ---
-        let mut header = Vec::with_capacity(40);
+        // --- Header (44 bytes) ---
+        let mut header = Vec::with_capacity(44);
         header.write_all(&(num_events as u32).to_le_bytes())?;
         header.write_all(&(num_mapping as u32).to_le_bytes())?;
         header.write_all(&(dict_raw.len() as u16).to_le_bytes())?;
         header.push(type_list.len() as u8);
         header.push(0); // padding
         header.write_all(&(mapping_ids_comp.len() as u32).to_le_bytes())?;
-        header.write_all(&(mapping_names_comp.len() as u32).to_le_bytes())?;
+        header.write_all(&(owners_comp.len() as u32).to_le_bytes())?;
+        header.write_all(&(repo_suffixes_comp.len() as u32).to_le_bytes())?;
         header.write_all(&(dict_comp.len() as u32).to_le_bytes())?;
         header.write_all(&(type_comp.len() as u32).to_le_bytes())?;
         header.write_all(&(event_ids_comp.len() as u32).to_le_bytes())?;
@@ -2826,7 +2858,8 @@ impl EventCodec for YimingQiaoCodec {
 
         let mut output = header;
         output.extend_from_slice(&mapping_ids_comp);
-        output.extend_from_slice(&mapping_names_comp);
+        output.extend_from_slice(&owners_comp);
+        output.extend_from_slice(&repo_suffixes_comp);
         output.extend_from_slice(&dict_comp);
         output.extend_from_slice(&type_comp);
         output.extend_from_slice(&event_ids_comp);
@@ -2837,11 +2870,11 @@ impl EventCodec for YimingQiaoCodec {
     }
 
     fn decode(&self, bytes: &[u8]) -> Result<Vec<(EventKey, EventValue)>, Box<dyn Error>> {
-        if bytes.len() < 40 {
+        if bytes.len() < 44 {
             return Err("Input too small for header".into());
         }
 
-        let header = &bytes[..40];
+        let header = &bytes[..44];
 
         // Parse header fields (little-endian)
         let num_events = u32::from_le_bytes(header[0..4].try_into()?) as usize;
@@ -2851,16 +2884,17 @@ impl EventCodec for YimingQiaoCodec {
         // header[11] is padding
 
         // Compressed column sizes
-        let map_ids_sz = u32::from_le_bytes(header[12..16].try_into()?) as usize;
-        let map_names_sz = u32::from_le_bytes(header[16..20].try_into()?) as usize;
-        let dict_sz = u32::from_le_bytes(header[20..24].try_into()?) as usize;
-        let type_sz = u32::from_le_bytes(header[24..28].try_into()?) as usize;
-        let event_ids_sz = u32::from_le_bytes(header[28..32].try_into()?) as usize;
-        let repo_sz = u32::from_le_bytes(header[32..36].try_into()?) as usize;
-        let ts_sz = u32::from_le_bytes(header[36..40].try_into()?) as usize;
+        let mapping_ids_sz = u32::from_le_bytes(header[12..16].try_into()?) as usize;
+        let owners_sz = u32::from_le_bytes(header[16..20].try_into()?) as usize;
+        let repo_suffixes_sz = u32::from_le_bytes(header[20..24].try_into()?) as usize;
+        let dict_sz = u32::from_le_bytes(header[24..28].try_into()?) as usize;
+        let type_sz = u32::from_le_bytes(header[28..32].try_into()?) as usize;
+        let event_ids_sz = u32::from_le_bytes(header[32..36].try_into()?) as usize;
+        let repo_sz = u32::from_le_bytes(header[36..40].try_into()?) as usize;
+        let ts_sz = u32::from_le_bytes(header[40..44].try_into()?) as usize;
 
         // Read compressed columns
-        let mut offset = 40;
+        let mut offset = 44;
         let mut next_chunk = |size: usize| -> Result<&[u8], Box<dyn Error>> {
             if bytes.len() < offset + size {
                 return Err("Truncated input".into());
@@ -2870,38 +2904,88 @@ impl EventCodec for YimingQiaoCodec {
             Ok(chunk)
         };
 
-        let mapping_ids_comp = next_chunk(map_ids_sz)?;
-        let mapping_names_comp = next_chunk(map_names_sz)?;
+        let mapping_ids_comp = next_chunk(mapping_ids_sz)?;
+        let owners_comp = next_chunk(owners_sz)?;
+        let repo_suffixes_comp = next_chunk(repo_suffixes_sz)?;
         let dict_comp = next_chunk(dict_sz)?;
         let type_comp = next_chunk(type_sz)?;
         let event_ids_comp = next_chunk(event_ids_sz)?;
         let repo_comp = next_chunk(repo_sz)?;
         let ts_comp = next_chunk(ts_sz)?;
 
-        let mapping_names_raw =
-            invert_preprocess_repo_name(zpaq::decompress_text(mapping_names_comp).as_slice());
-        let dict_raw = zpaq::decompress_text(dict_comp);
+        let owners_raw = lpaq1::decompress_text(owners_comp);
+        let repo_suffixes_raw = lpaq1::decompress_text(repo_suffixes_comp);
+        let dict_raw = lpaq1::decompress_text(dict_comp);
 
         if dict_raw.len() != dict_size {
             return Err("Event type dictionary size mismatch".into());
         }
 
-        // Mapping table
-        let repo_ids: Vec<u64> = simple_decompress(mapping_ids_comp)?;
-        if repo_ids.len() != num_mapping {
+        // Mapping IDs
+        let mapping_ids: Vec<u64> = simple_decompress(mapping_ids_comp)?;
+        if mapping_ids.len() != num_mapping {
             return Err("Mapping ID count mismatch".into());
         }
 
-        let mapping_names = String::from_utf8(mapping_names_raw)?;
-        let mapping_names: Vec<&str> = mapping_names.split('\n').collect();
-        if mapping_names.len() != num_mapping {
-            return Err("Mapping name count mismatch".into());
+        let owners_str = String::from_utf8(owners_raw)?;
+        let owners: Vec<&str> = if owners_str.is_empty() {
+            Vec::new()
+        } else {
+            owners_str.split('\n').collect()
+        };
+        if owners.len() != num_mapping {
+            return Err("Owner count mismatch".into());
         }
 
-        let mapping: Vec<(u64, &str)> = repo_ids
-            .into_iter()
-            .zip(mapping_names.into_iter())
-            .collect();
+        let mut repos: Vec<String> = Vec::with_capacity(num_mapping);
+        let mut repo_cursor = repo_suffixes_raw.as_slice();
+        for i in 0..num_mapping {
+            if repo_cursor.is_empty() {
+                return Err("Repo suffix payload too short".into());
+            }
+            let flag = repo_cursor[0];
+            repo_cursor = &repo_cursor[1..];
+            match flag {
+                0x01 => {
+                    repos.push(owners[i].to_string());
+                }
+                0x02 => {
+                    let null_pos =
+                        repo_cursor.iter().position(|&b| b == 0).unwrap_or(repo_cursor.len());
+                    if null_pos >= repo_cursor.len() {
+                        return Err("Repo suffix missing terminator".into());
+                    }
+                    let remainder = &repo_cursor[..null_pos];
+                    let remainder_str = String::from_utf8_lossy(remainder);
+                    repo_cursor = &repo_cursor[null_pos + 1..];
+                    repos.push(format!("{}{}", owners[i], remainder_str));
+                }
+                0x00 => {
+                    let null_pos =
+                        repo_cursor.iter().position(|&b| b == 0).unwrap_or(repo_cursor.len());
+                    if null_pos >= repo_cursor.len() {
+                        return Err("Repo suffix missing terminator".into());
+                    }
+                    let repo_bytes = &repo_cursor[..null_pos];
+                    let repo_str = String::from_utf8_lossy(repo_bytes);
+                    repo_cursor = &repo_cursor[null_pos + 1..];
+                    repos.push(repo_str.to_string());
+                }
+                _ => return Err("Unknown repo suffix flag".into()),
+            }
+        }
+        if !repo_cursor.is_empty() {
+            return Err("Repo suffix payload length mismatch".into());
+        }
+
+        let mut mapping_names: Vec<String> = Vec::with_capacity(num_mapping);
+        for i in 0..num_mapping {
+            if owners[i].is_empty() {
+                mapping_names.push(repos[i].clone());
+            } else {
+                mapping_names.push(format!("{}/{}", owners[i], repos[i]));
+            }
+        }
 
         // Event types
         let type_list_str = String::from_utf8(dict_raw)?;
@@ -2910,7 +2994,7 @@ impl EventCodec for YimingQiaoCodec {
             return Err("Event type count mismatch".into());
         }
 
-        let type_indices: Vec<u8> = zpaq::decompress_text(type_comp);
+        let type_indices: Vec<u8> = lpaq1::decompress_text(type_comp);
         if type_indices.len() != num_events {
             return Err("Type indices count mismatch".into());
         }
@@ -2924,7 +3008,7 @@ impl EventCodec for YimingQiaoCodec {
         }
 
         // Repo indices
-        let repo_indices: Vec<u32> = zpaq::decompress_text(repo_comp)
+        let repo_indices: Vec<u32> = lpaq1::decompress_text(repo_comp)
             .chunks_exact(4)
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
@@ -2938,14 +3022,20 @@ impl EventCodec for YimingQiaoCodec {
             return Err("Timestamp count mismatch".into());
         }
 
+        let mapping: Vec<(u64, String)> = mapping_ids
+            .into_iter()
+            .zip(mapping_names.into_iter())
+            .collect();
+
         // --- Assemble Events ---
         let mut events = Vec::with_capacity(num_events);
+
         for i in 0..num_events {
             let repo_idx = repo_indices[i] as usize;
             if repo_idx >= mapping.len() {
                 return Err(format!("Repo index {} out of bounds", repo_idx).into());
             }
-            let (repo_id, repo_name) = mapping[repo_idx];
+            let (repo_id, repo_name) = &mapping[repo_idx];
 
             let type_idx = type_indices[i] as usize;
             if type_idx >= type_list.len() {
@@ -2960,8 +3050,8 @@ impl EventCodec for YimingQiaoCodec {
                 },
                 EventValue {
                     repo: Repo {
-                        id: repo_id,
-                        name: repo_name.to_string(),
+                        id: *repo_id,
+                        name: repo_name.clone(),
                         url: format!("https://api.github.com/repos/{}", repo_name),
                     },
                     created_at: format_timestamp(timestamps[i]),
@@ -2976,8 +3066,8 @@ impl EventCodec for YimingQiaoCodec {
 
 fn maybe_dump_columns(
     mapping_ids: &[u64],
-    mapping_names_raw: &[u8],
-    mapping_names_pre: &[u8],
+    owners_raw: &[u8],
+    repo_suffixes_raw: &[u8],
     dict_raw: &[u8],
     type_indices: &[u8],
     event_ids: &[u64],
@@ -3022,8 +3112,8 @@ fn maybe_dump_columns(
     };
 
     write_bytes("mapping_ids.u64le", &to_u64_le(mapping_ids))?;
-    write_bytes("mapping_names_raw.txt", mapping_names_raw)?;
-    write_bytes("mapping_names_pre.bin", mapping_names_pre)?;
+    write_bytes("mapping_owners_raw.txt", owners_raw)?;
+    write_bytes("mapping_repo_suffixes_raw.bin", repo_suffixes_raw)?;
     write_bytes("dict_raw.txt", dict_raw)?;
     write_bytes("type_indices.u8", type_indices)?;
     write_bytes("event_ids.u64le", &to_u64_le(event_ids))?;
@@ -3032,16 +3122,16 @@ fn maybe_dump_columns(
 
     let meta = format!(
         "mapping_ids={}\n\
-mapping_names_raw_bytes={}\n\
-mapping_names_pre_bytes={}\n\
+mapping_owners_raw_bytes={}\n\
+mapping_repo_suffixes_raw_bytes={}\n\
 dict_raw_bytes={}\n\
 type_indices={}\n\
 event_ids={}\n\
 repo_indices={}\n\
 timestamps={}\n",
         mapping_ids.len(),
-        mapping_names_raw.len(),
-        mapping_names_pre.len(),
+        owners_raw.len(),
+        repo_suffixes_raw.len(),
         dict_raw.len(),
         type_indices.len(),
         event_ids.len(),
