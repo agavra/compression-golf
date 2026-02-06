@@ -15,7 +15,7 @@ use std::io::{Cursor, Write};
 use std::path::Path;
 
 use crate::codec::EventCodec;
-use crate::zpaq;
+use crate::zpaq5 as zpaq;
 use crate::{EventKey, EventValue, Repo};
 use std::error::Error;
 
