@@ -10,7 +10,9 @@ use pco::standalone::{simple_compress, simple_decompress};
 use pco::ChunkConfig;
 use pco::PagingSpec::EqualPagesUpTo;
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io::{Cursor, Write};
+use std::path::Path;
 
 use crate::codec::EventCodec;
 use crate::zpaq;
@@ -2772,6 +2774,20 @@ impl EventCodec for YimingQiaoCodec {
         // 7. Timestamps: i64s (pco will delta encode)
         let timestamps: Vec<i64> = raw_events.iter().map(|e| e.ts).collect();
 
+        let mapping_names_pre = preprocess_repo_names(mapping_names_raw.as_slice());
+
+        // Optional: export column buffers for external compressors (e.g., zpaq -m5)
+        maybe_dump_columns(
+            &mapping_ids,
+            &mapping_names_raw,
+            mapping_names_pre.as_slice(),
+            &dict_raw,
+            &type_indices,
+            &event_ids,
+            &repo_indices,
+            &timestamps,
+        )?;
+
         // --- Compress & Assemble ---
         let mut pco_config = ChunkConfig::default();
         pco_config.compression_level = 12;
@@ -2790,8 +2806,7 @@ impl EventCodec for YimingQiaoCodec {
                 .as_slice(),
         );
         let ts_comp = encode_timestamps_rans(&timestamps)?;
-        let mapping_names_comp =
-            zpaq::compress_text(preprocess_repo_names(mapping_names_raw.as_slice()).as_slice());
+        let mapping_names_comp = zpaq::compress_text(mapping_names_pre.as_slice());
         let dict_comp = zpaq::compress_text(&dict_raw);
 
         // --- Header (40 bytes) ---
@@ -2957,4 +2972,83 @@ impl EventCodec for YimingQiaoCodec {
         events.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(events)
     }
+}
+
+fn maybe_dump_columns(
+    mapping_ids: &[u64],
+    mapping_names_raw: &[u8],
+    mapping_names_pre: &[u8],
+    dict_raw: &[u8],
+    type_indices: &[u8],
+    event_ids: &[u64],
+    repo_indices: &[u32],
+    timestamps: &[i64],
+) -> Result<(), Box<dyn Error>> {
+    let out_dir = match std::env::var("EXPORT_COLS_DIR") {
+        Ok(v) if !v.is_empty() => v,
+        _ => return Ok(()),
+    };
+
+    fs::create_dir_all(&out_dir)?;
+    let base = Path::new(&out_dir);
+
+    let write_bytes = |name: &str, data: &[u8]| -> Result<(), Box<dyn Error>> {
+        let path = base.join(name);
+        let mut f = fs::File::create(path)?;
+        f.write_all(data)?;
+        Ok(())
+    };
+
+    let to_u64_le = |src: &[u64]| -> Vec<u8> {
+        let mut out = Vec::with_capacity(src.len() * 8);
+        for &v in src {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    };
+    let to_u32_le = |src: &[u32]| -> Vec<u8> {
+        let mut out = Vec::with_capacity(src.len() * 4);
+        for &v in src {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    };
+    let to_i64_le = |src: &[i64]| -> Vec<u8> {
+        let mut out = Vec::with_capacity(src.len() * 8);
+        for &v in src {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    };
+
+    write_bytes("mapping_ids.u64le", &to_u64_le(mapping_ids))?;
+    write_bytes("mapping_names_raw.txt", mapping_names_raw)?;
+    write_bytes("mapping_names_pre.bin", mapping_names_pre)?;
+    write_bytes("dict_raw.txt", dict_raw)?;
+    write_bytes("type_indices.u8", type_indices)?;
+    write_bytes("event_ids.u64le", &to_u64_le(event_ids))?;
+    write_bytes("repo_indices.u32le", &to_u32_le(repo_indices))?;
+    write_bytes("timestamps.i64le", &to_i64_le(timestamps))?;
+
+    let meta = format!(
+        "mapping_ids={}\n\
+mapping_names_raw_bytes={}\n\
+mapping_names_pre_bytes={}\n\
+dict_raw_bytes={}\n\
+type_indices={}\n\
+event_ids={}\n\
+repo_indices={}\n\
+timestamps={}\n",
+        mapping_ids.len(),
+        mapping_names_raw.len(),
+        mapping_names_pre.len(),
+        dict_raw.len(),
+        type_indices.len(),
+        event_ids.len(),
+        repo_indices.len(),
+        timestamps.len(),
+    );
+    write_bytes("meta.txt", meta.as_bytes())?;
+
+    Ok(())
 }

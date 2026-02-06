@@ -18,6 +18,7 @@ mod xiangpenghao;
 mod yimingqiao;
 mod xinyuzeng;
 mod zpaq;
+mod zpaq_consts;
 mod zstd;
 
 use agavra::AgavraCodec;
