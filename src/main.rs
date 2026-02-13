@@ -11,6 +11,7 @@ mod fulmicoton;
 mod hachikuji;
 mod jakedgy;
 mod kjcao;
+mod lifthrasiir;
 mod naive;
 mod natebrennand;
 mod samsond;
@@ -26,6 +27,7 @@ use fabinout::FabinoutCodec;
 use hachikuji::HachikujiCodec;
 use jakedgy::JakedgyCodec;
 use kjcao::KjcaoCodec;
+use lifthrasiir::LifthrasiirCodec;
 use naive::NaiveCodec;
 use natebrennand::NatebrennandCodec;
 use samsond::SamsondCodec;
@@ -210,6 +212,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         (Box::new(KjcaoCodec::new()), &sorted_events),
         (Box::new(YimingQiaoCodec::new()), &sorted_events),
         (Box::new(CometkimCodec::new()), &events),
+        (Box::new(LifthrasiirCodec::new()), &sorted_events),
     ];
 
     for (codec, expected) in codecs {
