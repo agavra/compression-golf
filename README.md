@@ -17,15 +17,16 @@ This leaderboard uses the `data.json.gz` dataset included in the repo. Use this 
 | 1    | [yimingqiao](src/yimingqiao.rs)    | 5,093,619    |
 | 2    | [kjcao](src/kjcao.rs)              | 5,188,464    |
 | 3    | [fulmicoton](src/fulmicoton.rs)    | 5,677,291    |
-| 4    | [xinyuzeng](src/xinyuzeng.rs)      | 5,784,827    |
-| 5    | [cometkim](src/cometkim.rs)        | 5,789,637    |
-| 6    | [natebrennand](src/natebrennand.rs)| 5,996,236    |
-| 7    | [jakedgy](src/jakedgy.rs)          | 6,402,499    |
-| 8    | [hachikuji](src/hachikuji.rs)      | 6,524,516    |
-| 9    | [XiangpengHao](src/xiangpenghao.rs)| 6,847,283    |
-| 10   | [agavra](src/agavra.rs)            | 7,273,680    |
-| 11   | [fabinout](src/fabinout.rs)        | 7,283,778    |
-| 12   | [samsond](src/samsond.rs)          | 7,564,554    |
+| 4    | [lifthrasiir](src/lifthrasiir.rs)  | 5,707,266    |
+| 5    | [xinyuzeng](src/xinyuzeng.rs)      | 5,784,827    |
+| 6    | [cometkim](src/cometkim.rs)        | 5,789,637    |
+| 7    | [natebrennand](src/natebrennand.rs)| 5,996,236    |
+| 8    | [jakedgy](src/jakedgy.rs)          | 6,402,499    |
+| 9    | [hachikuji](src/hachikuji.rs)      | 6,524,516    |
+| 10   | [XiangpengHao](src/xiangpenghao.rs)| 6,847,283    |
+| 11   | [agavra](src/agavra.rs)            | 7,273,680    |
+| 12   | [fabinout](src/fabinout.rs)        | 7,283,778    |
+| 13   | [samsond](src/samsond.rs)          | 7,564,554    |
 | 13   | *[Zstd(22)](src/zstd.rs)*          | 11,917,798   |
 | 14   | *[Zstd(9)](src/zstd.rs)*           | 17,869,403   |
 |      | *[Naive (baseline)](src/naive.rs)* | 210,727,389  |
